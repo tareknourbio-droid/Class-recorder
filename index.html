@@ -1670,7 +1670,41 @@ async function renderHwEntry(){
 }
 
 // ================= STUDENT REPORT =================
-let reportState = { groupId:null, studentId:null };
+let reportState = { groupId:null, studentId:null, period:'last4' };
+
+// ---------- helpers: WhatsApp report ----------
+function normalizePhoneForWa(phone){
+  if(!phone) return null;
+  let p = phone.replace(/[^0-9+]/g,'');
+  if(p.startsWith('+')) p = p.slice(1);
+  if(p.startsWith('00')) p = p.slice(2);
+  if(p.startsWith('0')) p = '20' + p.slice(1); // Egypt country code
+  else if(!p.startsWith('20')) p = '20' + p;
+  return p;
+}
+
+function periodLabel(period){
+  if(period==='last4') return 'آخر 4 حصص';
+  if(period==='last8') return 'آخر 8 حصص';
+  return 'كل الفترة';
+}
+
+async function copyTextToClipboard(text){
+  try{
+    await navigator.clipboard.writeText(text);
+    return true;
+  }catch(e){
+    try{
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      return true;
+    }catch(e2){ return false; }
+  }
+}
+
 function renderReport(main){
   if(state.students.length===0){
     main.innerHTML = `<div class="topbar"><div class="tabtitle">تقرير الطالب</div></div><div class="empty">لازم تضيف طلاب الأول عشان تقدر تطلع تقرير.</div>`;
@@ -1683,7 +1717,7 @@ function renderReport(main){
   }
   main.innerHTML = `
     <div class="topbar">
-      <div><div class="tabtitle">تقرير الطالب</div><div class="tabsub">متابعة كاملة من أول حصة لآخر حصة</div></div>
+      <div><div class="tabtitle">تقرير الطالب</div><div class="tabsub">تقرير دوري لمتابعة المستوى مع ولي الأمر</div></div>
       <button class="btn btn-ghost" id="printReport">🖨 طباعة / حفظ PDF</button>
     </div>
     <div class="row" id="reportControls" style="margin-bottom:16px;">
@@ -1695,6 +1729,14 @@ function renderReport(main){
         <label class="field-label">الطالب</label>
         <select id="repStudent">${groupStudents.map(s=>`<option value="${s.id}" ${reportState.studentId===s.id?'selected':''}>${s.name}</option>`).join('')}</select>
       </div>
+      <div>
+        <label class="field-label">الفترة</label>
+        <select id="repPeriod">
+          <option value="last4" ${reportState.period==='last4'?'selected':''}>آخر 4 حصص</option>
+          <option value="last8" ${reportState.period==='last8'?'selected':''}>آخر 8 حصص</option>
+          <option value="all" ${reportState.period==='all'?'selected':''}>كل الفترة</option>
+        </select>
+      </div>
     </div>
     <div id="reportBody"><div class="loading">جارِ تجميع التقرير...</div></div>
   `;
@@ -1704,6 +1746,9 @@ function renderReport(main){
   document.getElementById('repStudent').addEventListener('change',(e)=>{
     reportState.studentId = e.target.value; buildReportBody();
   });
+  document.getElementById('repPeriod').addEventListener('change',(e)=>{
+    reportState.period = e.target.value; buildReportBody();
+  });
   document.getElementById('printReport').addEventListener('click',()=>window.print());
   buildReportBody();
 }
@@ -1712,22 +1757,34 @@ async function buildReportBody(){
   const body = document.getElementById('reportBody');
   const student = state.students.find(s=>s.id===reportState.studentId);
   if(!student){ body.innerHTML = `<div class="empty">اختار طالب.</div>`; return; }
+  const period = reportState.period || 'all';
 
   // attendance across all sessions of the student's group
   const attKeys = await sList(`attendance:${student.groupId}:`);
-  const dates = attKeys.map(k=>k.split(':')[2]).sort();
-  const attRecords = await Promise.all(dates.map(async d=>({date:d, rec:(await sGet(`attendance:${student.groupId}:${d}`))||{}})));
+  const allDates = attKeys.map(k=>k.split(':')[2]).sort();
+  const totalSessionsAllTime = allDates.length;
+
+  // determine the window of dates for the selected period
+  let windowDates = allDates;
+  if(period==='last4') windowDates = allDates.slice(-4);
+  else if(period==='last8') windowDates = allDates.slice(-8);
+  const winStart = windowDates.length? windowDates[0] : null;
+  const winEnd = windowDates.length? windowDates[windowDates.length-1] : null;
+  const winDateSet = new Set(windowDates);
+
+  const attRecords = await Promise.all(windowDates.map(async d=>({date:d, rec:(await sGet(`attendance:${student.groupId}:${d}`))||{}})));
   const attHistory = attRecords
     .filter(x=>x.rec.hasOwnProperty(student.id))
     .map(x=>({date:x.date, status:x.rec[student.id]}));
-  const totalSessions = dates.length;
+  const totalSessions = windowDates.length;
   const pCount = attHistory.filter(x=>x.status==='present').length;
   const lCount = attHistory.filter(x=>x.status==='late').length;
   const aCount = attHistory.filter(x=>x.status==='absent').length;
   const attRate = totalSessions>0 ? Math.round(((pCount+lCount)/totalSessions)*100) : null;
 
-  // grades across all assessments of the group
-  const groupAssessments = state.assessments.filter(a=>a.groupId===student.groupId).sort((a,b)=>a.date.localeCompare(b.date));
+  // grades: assessments whose date falls inside the period window
+  const allGroupAssessments = state.assessments.filter(a=>a.groupId===student.groupId).sort((a,b)=>a.date.localeCompare(b.date));
+  const groupAssessments = (winStart===null) ? [] : allGroupAssessments.filter(a=> a.date>=winStart && a.date<=winEnd);
   const gradeRows = await Promise.all(groupAssessments.map(async a=>{
     const scores = (await sGet(`scores:${a.id}`)) || {};
     return {title:a.title, date:a.date, maxScore:a.maxScore, score: scores.hasOwnProperty(student.id)? scores[student.id] : null};
@@ -1735,8 +1792,9 @@ async function buildReportBody(){
   const gradedRows = gradeRows.filter(r=>r.score!==null);
   const avgPct = gradedRows.length? Math.round(gradedRows.reduce((s,r)=>s+(r.score/r.maxScore*100),0)/gradedRows.length) : null;
 
-  // homework across all homework items of the group
-  const groupHw = state.homeworkList.filter(h=>h.groupId===student.groupId).sort((a,b)=>a.dueDate.localeCompare(b.dueDate));
+  // homework: items whose due date falls inside the period window
+  const allGroupHw = state.homeworkList.filter(h=>h.groupId===student.groupId).sort((a,b)=>a.dueDate.localeCompare(b.dueDate));
+  const groupHw = (winStart===null) ? [] : allGroupHw.filter(h=> h.dueDate>=winStart && h.dueDate<=winEnd);
   const hwRows = await Promise.all(groupHw.map(async h=>{
     const status = (await sGet(`hwStatus:${h.id}`)) || {};
     return {title:h.title, dueDate:h.dueDate, done: !!status[student.id]};
@@ -1745,6 +1803,8 @@ async function buildReportBody(){
   const hwRate = groupHw.length? Math.round((hwDoneCount/groupHw.length)*100) : null;
 
   if(document.getElementById('repStudent')?.value !== student.id) return; // stale render guard
+
+  const periodRangeText = (winStart && winEnd) ? `من ${fmtDate(winStart)} إلى ${fmtDate(winEnd)}` : 'لا توجد حصص مسجلة';
 
   body.innerHTML = `
     <div class="report-brand">
@@ -1758,20 +1818,34 @@ async function buildReportBody(){
       <div class="report-head">
         <div>
           <div class="report-student">${student.name}</div>
-          <div class="report-meta"><span class="group-color" style="background:${groupColor(student.groupId)}"></span> ${groupName(student.groupId)}</div>
+          <div class="report-meta"><span class="group-color" style="background:${groupColor(student.groupId)}"></span> ${groupName(student.groupId)} · ${periodLabel(period)}</div>
+          <div class="report-meta" style="margin-top:4px;">${periodRangeText}</div>
         </div>
       </div>
       <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); margin-top:16px;">
         <div class="stat"><div class="num">${attRate!==null? attRate+'%':'—'}</div><div class="lbl">نسبة الحضور</div></div>
         <div class="stat"><div class="num">${avgPct!==null? avgPct+'%':'—'}</div><div class="lbl">متوسط الدرجات</div></div>
         <div class="stat"><div class="num">${hwRate!==null? hwRate+'%':'—'}</div><div class="lbl">تسليم الواجبات</div></div>
-        <div class="stat"><div class="num">${totalSessions}</div><div class="lbl">إجمالي الحصص</div></div>
+        <div class="stat"><div class="num">${totalSessions}</div><div class="lbl">حصص هذه الفترة</div></div>
       </div>
+      ${period!=='all' && totalSessionsAllTime>totalSessions? `<div class="report-meta" style="margin-top:10px;">إجمالي حصص الطالب من البداية: ${totalSessionsAllTime}</div>`:''}
+    </div>
+
+    <div class="card">
+      <div class="field-label" style="margin-bottom:8px;">ملاحظة إضافية لولي الأمر (اختياري، تُضاف لرسالة واتساب فقط)</div>
+      <div class="note-input-row">
+        <textarea id="repExtraNote" placeholder="مثال: محتاج مراجعة أكتر في وحدة الخلية..."></textarea>
+      </div>
+      <div class="modal-actions" style="margin-top:12px;">
+        <button class="btn btn-primary" id="waSendBtn">💬 إرسال واتساب لولي الأمر</button>
+        <button class="btn btn-ghost" id="waCopyBtn">📋 نسخ نص الرسالة</button>
+      </div>
+      ${!student.parentPhone? `<div class="report-meta" style="margin-top:8px;color:var(--late);">لا يوجد رقم ولي أمر مسجل — سجّله من بيانات الطالب عشان زرار الإرسال يشتغل مباشرة.</div>`:''}
     </div>
 
     <div class="card">
       <div class="section-title"><span style="width:16px;height:16px;display:inline-flex;">${ICONS.attendance}</span> سجل الحضور (${attHistory.length} من ${totalSessions})</div>
-      ${attHistory.length===0? `<div class="empty">مفيش سجل حضور لهذا الطالب لسه.</div>` : `
+      ${attHistory.length===0? `<div class="empty">مفيش سجل حضور لهذا الطالب في هذه الفترة.</div>` : `
       <div class="timeline">
         ${attHistory.slice().reverse().map(x=>`
           <div class="tl-item ${x.status==='absent'?'tl-absent':x.status==='late'?'tl-late':''}">
@@ -1785,7 +1859,7 @@ async function buildReportBody(){
 
     <div class="card">
       <div class="section-title">📊 الدرجات (${gradedRows.length} من ${groupAssessments.length})</div>
-      ${groupAssessments.length===0? `<div class="empty">لسه مفيش تقييمات مسجلة لهذه المجموعة.</div>` : `
+      ${groupAssessments.length===0? `<div class="empty">لا توجد تقييمات في هذه الفترة.</div>` : `
       <table>
         <thead><tr><th>التقييم</th><th>التاريخ</th><th>الدرجة</th></tr></thead>
         <tbody>
@@ -1800,7 +1874,7 @@ async function buildReportBody(){
 
     <div class="card">
       <div class="section-title">📝 الواجبات (${hwDoneCount} من ${groupHw.length})</div>
-      ${groupHw.length===0? `<div class="empty">لسه مفيش واجبات مسجلة لهذه المجموعة.</div>` : `
+      ${groupHw.length===0? `<div class="empty">لا توجد واجبات في هذه الفترة.</div>` : `
       <table>
         <thead><tr><th>الواجب</th><th>تاريخ التسليم</th><th>الحالة</th></tr></thead>
         <tbody>
@@ -1813,6 +1887,43 @@ async function buildReportBody(){
       </table>`}
     </div>
   `;
+
+  const buildWaText = ()=>{
+    const extra = document.getElementById('repExtraNote')?.value.trim();
+    let lines = [];
+    lines.push(`👋 تقرير متابعة الطالب/ة: *${student.name}*`);
+    lines.push(`📚 المجموعة: ${groupName(student.groupId)}`);
+    lines.push(`🗓️ الفترة: ${periodLabel(period)} (${periodRangeText})`);
+    lines.push('');
+    lines.push(`✅ الحضور: ${attRate!==null? attRate+'%':'—'} (${pCount+lCount} من ${totalSessions} حصة${lCount?` منها ${lCount} متأخر`:''}${aCount?`، غياب ${aCount}`:''})`);
+    lines.push(`📊 متوسط الدرجات: ${avgPct!==null? avgPct+'%':'لا توجد تقييمات'}`);
+    if(gradedRows.length){
+      gradedRows.forEach(r=> lines.push(`   • ${r.title}: ${r.score}/${r.maxScore}`));
+    }
+    lines.push(`📝 الواجبات: ${hwDoneCount} من ${groupHw.length}${hwRate!==null?` (${hwRate}%)`:''}`);
+    const missedHw = hwRows.filter(r=>!r.done);
+    if(missedHw.length){
+      lines.push(`   ⚠️ لم يتم تسليم: ${missedHw.map(r=>r.title).join('، ')}`);
+    }
+    if(extra){
+      lines.push('');
+      lines.push(`🗒️ ملاحظة: ${extra}`);
+    }
+    lines.push('');
+    lines.push('Tarek Nour Biology 📞 01202697906');
+    return lines.join('\n');
+  };
+
+  document.getElementById('waCopyBtn').addEventListener('click', async ()=>{
+    const ok = await copyTextToClipboard(buildWaText());
+    alert(ok? 'تم نسخ الرسالة، تقدر تلصقها في واتساب.' : 'تعذّر النسخ التلقائي، انسخ النص يدويًا.');
+  });
+  document.getElementById('waSendBtn').addEventListener('click', ()=>{
+    const text = encodeURIComponent(buildWaText());
+    const phone = normalizePhoneForWa(student.parentPhone);
+    const url = phone? `https://wa.me/${phone}?text=${text}` : `https://wa.me/?text=${text}`;
+    window.open(url, '_blank');
+  });
 }
 
 // ================= NOTES & BOOKLET (secretary follow-up) =================
