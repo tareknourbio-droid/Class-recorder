@@ -1044,7 +1044,7 @@ function renderStudents(main){
         <td><span class="group-color" style="background:${groupColor(s.groupId)}"></span> ${groupName(s.groupId)}</td>
         <td style="text-align:left;">
           <button class="btn btn-ghost btn-sm" data-edit="${s.id}">تعديل</button>
-          <button class="btn btn-danger btn-sm" data-del="${s.id}">حذف</button>
+          ${currentRole==='teacher'? `<button class="btn btn-danger btn-sm" data-del="${s.id}">حذف</button>` : ''}
         </td>
       </tr>`).join('');
     tbody.querySelectorAll('[data-view]').forEach(el=>el.addEventListener('click',()=>{
@@ -1142,6 +1142,7 @@ async function openStudentModal(studentId){
 }
 
 async function deleteStudent(id){
+  if(currentRole==='secretary'){ alert('حذف الطلاب متاح للمدرّس بس — كلّم د. طارق لو محتاجة تحذفي طالب.'); return; }
   if(!confirm('حذف الطالب ده؟')) return;
   state.students = state.students.filter(s=>s.id!==id);
   await sSet('students', state.students);
