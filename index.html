@@ -434,6 +434,9 @@ const firebaseConfig = {
 };
 // البريد اللي هتسجّله في Firebase Authentication (مش هيظهر لحد، بس لازم تحطه هنا)
 const TEACHER_EMAIL = "tareknourbio@gmail.com";
+// إيميل حساب السكرتيرة (لازم تعمله في Firebase Authentication الأول، وتحط نفس الإيميل هنا بالظبط)
+const SECRETARY_EMAIL = "tareknourbio+secretary@gmail.com";
+let currentRole = 'teacher'; // 'teacher' | 'secretary' — بيتحدد تلقائي بعد تسجيل الدخول
 
 firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
@@ -456,9 +459,18 @@ async function sSet(key, value){
 }
 async function sList(prefix){
   try{
-    const snap = await db.collection('app_data').get();
-    return snap.docs.map(d=>d.id).filter(k=>!prefix || k.startsWith(prefix));
-  }catch(e){ return []; }
+    if(!prefix){
+      const snap = await db.collection('app_data').get();
+      return snap.docs.map(d=>d.id);
+    }
+    const start = prefix;
+    const end = prefix + '\uf8ff';
+    const snap = await db.collection('app_data')
+      .where(firebase.firestore.FieldPath.documentId(), '>=', start)
+      .where(firebase.firestore.FieldPath.documentId(), '<=', end)
+      .get();
+    return snap.docs.map(d=>d.id);
+  }catch(e){ console.error(e); return []; }
 }
 async function sDelete(key){
   try{ await db.collection('app_data').doc(key).delete(); return true; }
@@ -551,12 +563,12 @@ function render(){
         ${navItem('grades','الدرجات','grades')}
         ${navItem('homework','الواجبات','homework')}
         ${navItem('report','تقرير الطالب','report')}
-        ${navItem('payments','المدفوعات','payments')}
+        ${currentRole==='teacher'? navItem('payments','المدفوعات','payments') : ''}
         ${navItem('bulk','رسالة جماعية','bulk')}
         ${navItem('msglog','أرشيف الرسائل','msglog')}
         ${navItem('notes','ملاحظات وتواصل','notes')}
       </div>
-      <div class="sidebar-footer">بياناتك متحفوظة أونلاين وهتلاقيها من أي جهاز.<div class="sidebar-phone">📞 01202697906</div><div id="logoutBtn" style="margin-top:8px; cursor:pointer; color:var(--gold-2); text-decoration:underline;">تسجيل خروج</div></div>
+      <div class="sidebar-footer">بياناتك متحفوظة أونلاين وهتلاقيها من أي جهاز.<div class="sidebar-phone">📞 01202697906</div><div style="margin-top:6px; color:var(--muted); font-size:11.5px;">الدخول كـ: ${currentRole==='secretary'?'السكرتيرة':'المدرّس'}</div><div id="logoutBtn" style="margin-top:8px; cursor:pointer; color:var(--gold-2); text-decoration:underline;">تسجيل خروج</div></div>
     </div>
     <div class="main" id="main"></div>
   `;
@@ -599,6 +611,7 @@ function navItem(tab,label,icon){
 }
 
 async function renderMain(){
+  if(currentRole==='secretary' && state.tab==='payments') state.tab='home';
   document.querySelectorAll('.navitem').forEach(el=>{
     el.classList.toggle('active', el.dataset.tab===state.tab || (state.tab==='profile' && el.dataset.tab==='students'));
   });
@@ -711,14 +724,16 @@ async function computeDashboardData(){
       });
     }
 
-    // unpaid current month alert (month = 4 sessions, only once the month is fully done)
-    const { dates: cycleAllDates, currentCycle } = await getGroupCycleInfo(g.id);
-    const cycleDates = cycleAllDates.slice((currentCycle-1)*4, currentCycle*4);
-    if(cycleDates.length===4){
-      for(const s of groupStudents){
-        const rec = await sGet(`payment:${s.id}:${currentCycle}`);
-        if(!rec || !rec.paid){
-          alerts.push({level:'yellow', icon:'💰', text:`${s.name} خلّص الشهر ${currentCycle} ولسه ما دفعش — ${g.name}`});
+    // unpaid current month alert (teacher only — secretary role has no payment visibility)
+    if(currentRole==='teacher'){
+      const { dates: cycleAllDates, currentCycle } = await getGroupCycleInfo(g.id);
+      const cycleDates = cycleAllDates.slice((currentCycle-1)*4, currentCycle*4);
+      if(cycleDates.length===4){
+        for(const s of groupStudents){
+          const rec = await sGet(`payment:${s.id}:${currentCycle}`);
+          if(!rec || !rec.paid){
+            alerts.push({level:'yellow', icon:'💰', text:`${s.name} خلّص الشهر ${currentCycle} ولسه ما دفعش — ${g.name}`});
+          }
         }
       }
     }
@@ -840,6 +855,7 @@ async function renderHome(main){
       <h3 style="color:var(--accent); margin-bottom:10px;">🔔 التنبيهات</h3>
       <div class="dash-loading">جارِ الفحص...</div>
     </div>
+    ${currentRole==='teacher' ? `
     <div class="card">
       <h3 style="color:var(--accent); margin-bottom:10px;">🛠️ أدوات وإدارة البيانات</h3>
       <div class="modal-actions">
@@ -847,7 +863,7 @@ async function renderHome(main){
         <button class="btn btn-ghost" id="downloadBackupBtn">💾 تنزيل نسخة احتياطية</button>
       </div>
       <div class="report-meta" style="margin-top:8px;">النسخة الاحتياطية بتاخد كل بيانات الأداة كاملة كملف JSON، تقدر تحتفظ بيه في مكان آمن.</div>
-    </div>
+    </div>` : ''}
     <div class="card">
       <h3 style="color:var(--accent); margin-bottom:10px;">مجموعاتك</h3>
       ${state.groups.length===0? `<div class="empty">لسه ما ضفتش أي مجموعة. روح لتبويب "المجموعات" وابدأ.</div>` :
@@ -859,12 +875,12 @@ async function renderHome(main){
     </div>
   `;
 
-  document.getElementById('exportExcelBtn').addEventListener('click', async (e)=>{
+  document.getElementById('exportExcelBtn')?.addEventListener('click', async (e)=>{
     const btn = e.target; const oldLabel = btn.textContent;
     btn.disabled = true; btn.textContent = 'جارِ التجهيز...';
     try{ await exportExcel(); } finally { btn.disabled = false; btn.textContent = oldLabel; }
   });
-  document.getElementById('downloadBackupBtn').addEventListener('click', async (e)=>{
+  document.getElementById('downloadBackupBtn')?.addEventListener('click', async (e)=>{
     const btn = e.target; const oldLabel = btn.textContent;
     btn.disabled = true; btn.textContent = 'جارِ التجهيز...';
     try{ await downloadBackup(); } finally { btn.disabled = false; btn.textContent = oldLabel; }
@@ -3002,6 +3018,13 @@ function showLoginScreen(errorMsg){
       <div class="brand-grad" style="font-size:22px;font-weight:800;font-family:'Cairo',sans-serif;">Tarek Nour Biology</div>
       <form id="loginForm" class="card" style="width:100%; max-width:320px; display:flex; flex-direction:column; gap:12px;">
         <div>
+          <label class="field-label">الدخول كـ</label>
+          <select id="loginRole" style="width:100%;">
+            <option value="teacher">المدرّس (طارق)</option>
+            <option value="secretary">السكرتيرة</option>
+          </select>
+        </div>
+        <div>
           <label class="field-label">كلمة السر</label>
           <input type="password" id="loginPass" required style="width:100%;" autofocus>
         </div>
@@ -3014,22 +3037,26 @@ function showLoginScreen(errorMsg){
   document.getElementById('loginForm').addEventListener('submit', async (e)=>{
     e.preventDefault();
     const pass = document.getElementById('loginPass').value;
+    const role = document.getElementById('loginRole').value;
+    const email = role==='secretary' ? SECRETARY_EMAIL : TEACHER_EMAIL;
     const btn = e.target.querySelector('button[type="submit"]');
     btn.disabled = true; btn.textContent = 'بيدخل...';
     try{
-      await auth.signInWithEmailAndPassword(TEACHER_EMAIL, pass);
+      await auth.signInWithEmailAndPassword(email, pass);
     }catch(err){
       showLoginScreen('كلمة السر غلط أو حصلت مشكلة، حاول تاني');
     }
   });
   document.getElementById('forgotPassBtn').addEventListener('click', async ()=>{
     const btn = document.getElementById('forgotPassBtn');
+    const role = document.getElementById('loginRole').value;
+    const email = role==='secretary' ? SECRETARY_EMAIL : TEACHER_EMAIL;
     btn.disabled = true;
     try{
-      await auth.sendPasswordResetEmail(TEACHER_EMAIL);
+      await auth.sendPasswordResetEmail(email);
       showLoginScreen('');
       document.getElementById('loginError').style.color = 'var(--present)';
-      document.getElementById('loginError').textContent = `تم إرسال رابط تغيير كلمة السر إلى ${TEACHER_EMAIL} — افتح الإيميل واتبع الخطوات`;
+      document.getElementById('loginError').textContent = `تم إرسال رابط تغيير كلمة السر إلى ${email} — افتح الإيميل واتبع الخطوات`;
     }catch(err){
       showLoginScreen('');
       document.getElementById('loginError').textContent = 'حصلت مشكلة في إرسال الإيميل، حاول تاني بعد شوية';
@@ -3044,6 +3071,8 @@ function logout(){
 // ---------- boot ----------
 auth.onAuthStateChanged(async (user)=>{
   if(user){
+    currentRole = (user.email===SECRETARY_EMAIL) ? 'secretary' : 'teacher';
+    if(currentRole==='secretary' && state.tab==='payments') state.tab='home';
     await loadCore();
     render();
   } else {
