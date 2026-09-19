@@ -641,28 +641,34 @@ async function computeDashboardData(){
   const alerts = [];
   let bestGroup = null, bestGroupPct = -1;
 
-  for(const g of state.groups){
+  const groupResults = await Promise.all(state.groups.map(async (g)=>{
     const groupStudents = studentsOf(g.id);
-    if(groupStudents.length===0) continue;
+    if(groupStudents.length===0) return null;
 
-    // today's attendance tally
-    const todayRec = await sGet(`attendance:${g.id}:${today}`);
+    const groupAlerts = [];
+    let groupPct = null;
+
+    const [todayRec, keys] = await Promise.all([
+      sGet(`attendance:${g.id}:${today}`),
+      sList(`attendance:${g.id}:`)
+    ]);
+
+    let markedToday = false, gPresent=0, gLate=0, gAbsent=0;
     if(todayRec){
-      markedGroupsToday++;
+      markedToday = true;
       groupStudents.forEach(s=>{
         const st = todayRec[s.id];
-        if(st==='present') presentToday++;
-        else if(st==='late') lateToday++;
-        else if(st==='absent') absentToday++;
+        if(st==='present') gPresent++;
+        else if(st==='late') gLate++;
+        else if(st==='absent') gAbsent++;
       });
     }
 
-    // scan all recorded sessions for this group
-    const keys = await sList(`attendance:${g.id}:`);
     const dates = keys.map(k=>k.split(':')[2]).filter(Boolean).sort();
     if(dates.length>0){
+      const recordList = await Promise.all(dates.map(d=> sGet(`attendance:${g.id}:${d}`)));
       const records = {};
-      for(const d of dates){ records[d] = (await sGet(`attendance:${g.id}:${d}`)) || {}; }
+      dates.forEach((d,i)=>{ records[d] = recordList[i] || {}; });
 
       let totalMarks=0, presentMarks=0;
       groupStudents.forEach(s=>{
@@ -671,12 +677,8 @@ async function computeDashboardData(){
           if(st){ totalMarks++; if(st==='present'||st==='late') presentMarks++; }
         });
       });
-      if(totalMarks>0){
-        const pct = Math.round((presentMarks/totalMarks)*100);
-        if(pct>bestGroupPct){ bestGroupPct=pct; bestGroup=g.name; }
-      }
+      if(totalMarks>0) groupPct = Math.round((presentMarks/totalMarks)*100);
 
-      // per-student overall attendance rate (low attendance alert)
       groupStudents.forEach(s=>{
         let marks=0, present=0;
         dates.forEach(d=>{
@@ -685,30 +687,27 @@ async function computeDashboardData(){
         });
         if(marks>=4){
           const rate = Math.round((present/marks)*100);
-          if(rate<60){
-            alerts.push({level:'red', icon:'🔴', text:`${s.name} نسبة حضوره منخفضة (${rate}%) — ${g.name}`});
-          }
+          if(rate<60) groupAlerts.push({level:'red', icon:'🔴', text:`${s.name} نسبة حضوره منخفضة (${rate}%) — ${g.name}`});
         }
       });
 
-      // students absent in the last two recorded sessions of this group
       const lastTwo = dates.slice(-2);
       if(lastTwo.length===2){
         groupStudents.forEach(s=>{
           const st1 = records[lastTwo[0]][s.id];
           const st2 = records[lastTwo[1]][s.id];
           if(st1==='absent' && st2==='absent'){
-            alerts.push({level:'red', icon:'🔴', text:`${s.name} غاب آخر حصتين على التوالي (${g.name})`});
+            groupAlerts.push({level:'red', icon:'🔴', text:`${s.name} غاب آخر حصتين على التوالي (${g.name})`});
           }
         });
       }
     }
 
-    // weak grades alert
     const groupAssessments = state.assessments.filter(a=>a.groupId===g.id);
     if(groupAssessments.length>0){
+      const scoresList = await Promise.all(groupAssessments.map(a=> sGet(`scores:${a.id}`)));
       const scoresByAssessment = {};
-      for(const a of groupAssessments){ scoresByAssessment[a.id] = (await sGet(`scores:${a.id}`)) || {}; }
+      groupAssessments.forEach((a,i)=>{ scoresByAssessment[a.id] = scoresList[i] || {}; });
       groupStudents.forEach(s=>{
         let sum=0, count=0;
         groupAssessments.forEach(a=>{
@@ -717,27 +716,36 @@ async function computeDashboardData(){
         });
         if(count>=1){
           const avg = Math.round(sum/count);
-          if(avg<50){
-            alerts.push({level:'yellow', icon:'🟡', text:`${s.name} متوسط درجاته ضعيف (${avg}%) — ${g.name}`});
-          }
+          if(avg<50) groupAlerts.push({level:'yellow', icon:'🟡', text:`${s.name} متوسط درجاته ضعيف (${avg}%) — ${g.name}`});
         }
       });
     }
 
-    // unpaid current month alert (teacher only — secretary role has no payment visibility)
     if(currentRole==='teacher'){
-      const { dates: cycleAllDates, currentCycle } = await getGroupCycleInfo(g.id);
-      const cycleDates = cycleAllDates.slice((currentCycle-1)*4, currentCycle*4);
+      const currentCycle = Math.max(1, Math.ceil(dates.length/4) || 1);
+      const cycleDates = dates.slice((currentCycle-1)*4, currentCycle*4);
       if(cycleDates.length===4){
-        for(const s of groupStudents){
-          const rec = await sGet(`payment:${s.id}:${currentCycle}`);
+        const paymentRecs = await Promise.all(groupStudents.map(s=> sGet(`payment:${s.id}:${currentCycle}`)));
+        groupStudents.forEach((s,i)=>{
+          const rec = paymentRecs[i];
           if(!rec || !rec.paid){
-            alerts.push({level:'yellow', icon:'💰', text:`${s.name} خلّص الشهر ${currentCycle} ولسه ما دفعش — ${g.name}`});
+            groupAlerts.push({level:'yellow', icon:'💰', text:`${s.name} خلّص الشهر ${currentCycle} ولسه ما دفعش — ${g.name}`});
           }
-        }
+        });
       }
     }
-  }
+
+    return { groupName:g.name, groupPct, markedToday, gPresent, gLate, gAbsent, groupAlerts };
+  }));
+
+  groupResults.filter(Boolean).forEach(r=>{
+    if(r.markedToday){
+      markedGroupsToday++;
+      presentToday += r.gPresent; lateToday += r.gLate; absentToday += r.gAbsent;
+    }
+    if(r.groupPct!=null && r.groupPct>bestGroupPct){ bestGroupPct=r.groupPct; bestGroup=r.groupName; }
+    alerts.push(...r.groupAlerts);
+  });
 
   if(bestGroup){
     alerts.push({level:'green', icon:'🟢', text:`أعلى نسبة حضور: ${bestGroup} (${bestGroupPct}%)`});
@@ -1783,7 +1791,10 @@ async function renderGrades(main){
   main.innerHTML = `
     <div class="topbar">
       <div><div class="tabtitle">الدرجات</div><div class="tabsub">سجّل نتائج الاختبارات والتقييمات</div></div>
-      <button class="btn btn-gold" id="newAssessBtn">+ تقييم جديد</button>
+      <div class="row" style="gap:8px;">
+        <button class="btn btn-gold" id="newAssessBtn">+ تقييم جديد</button>
+        ${currentRole==='teacher'? `<button class="btn btn-ghost" id="newExamBtn">🖥️ امتحان إلكتروني</button>` : ''}
+      </div>
     </div>
     <div class="row" style="margin-bottom:16px;">
       <div>
@@ -1798,6 +1809,7 @@ async function renderGrades(main){
     gradesState.groupId = e.target.value; gradesState.openAssessment=null; renderGrades(main);
   });
   document.getElementById('newAssessBtn').addEventListener('click',()=>openAssessmentModal());
+  document.getElementById('newExamBtn')?.addEventListener('click',()=>openOnlineExamModal());
   renderAssessList();
   if(gradesState.openAssessment) renderScoreEntry();
 }
@@ -1809,7 +1821,7 @@ function renderAssessList(){
   div.innerHTML = list.map(a=>`
     <div class="list-item" data-id="${a.id}">
       <div>
-        <div style="font-weight:700;">${a.title}</div>
+        <div style="font-weight:700;">${a.title} ${a.isOnline? '<span class="badge badge-late" style="margin-inline-start:6px;">🖥️ إلكتروني</span>':''}</div>
         <div style="font-size:12px;color:var(--muted);">${fmtDate(a.date)} · من ${a.maxScore} درجة</div>
       </div>
       <div class="row">
@@ -1872,15 +1884,147 @@ function openAssessmentModal(){
   });
 }
 
+function openOnlineExamModal(){
+  const overlay = document.createElement('div');
+  overlay.className='modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal" style="max-width:560px; max-height:85vh; overflow-y:auto;">
+      <h3>امتحان إلكتروني جديد</h3>
+      <div class="field"><label class="field-label">اسم الامتحان</label><input id="examTitle" placeholder="مثال: اختبار الوحدة الثانية"></div>
+      <div class="field"><label class="field-label">التاريخ</label><input id="examDate" type="date" value="${todayStr()}"></div>
+      <div id="examQuestions"></div>
+      <button type="button" class="btn btn-ghost" id="addQuestionBtn" style="margin:10px 0;">+ سؤال جديد</button>
+      <div class="report-meta" style="margin-bottom:10px;">كل سؤال درجة واحدة. حط علامة صح جنب الاختيار الصحيح.</div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" id="saveExamBtn">حفظ ونشر الامتحان</button>
+        <button class="btn btn-ghost" id="cancelExamBtn">إلغاء</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  let qCount = 0;
+  function addQuestionRow(){
+    qCount++;
+    const qId = qCount;
+    const row = document.createElement('div');
+    row.className='card'; row.style.marginBottom='10px'; row.dataset.qid = qId;
+    row.innerHTML = `
+      <div class="row" style="justify-content:space-between; align-items:center;">
+        <div class="field-label">سؤال ${qId}</div>
+        <button type="button" class="btn btn-danger btn-sm" data-remove-q>حذف السؤال</button>
+      </div>
+      <div class="field"><input placeholder="نص السؤال" data-qtext></div>
+      ${[0,1,2,3].map(i=>`
+        <div class="row" style="align-items:center; gap:8px; margin-top:6px;">
+          <input type="radio" name="correct-${qId}" data-correct-radio value="${i}">
+          <input placeholder="اختيار ${i+1}${i>=2?' (اختياري)':''}" data-option style="flex:1;">
+        </div>`).join('')}
+    `;
+    document.getElementById('examQuestions').appendChild(row);
+    row.querySelector('[data-remove-q]').addEventListener('click',()=>row.remove());
+  }
+  document.getElementById('addQuestionBtn').addEventListener('click', addQuestionRow);
+  addQuestionRow();
+
+  overlay.querySelector('#cancelExamBtn').addEventListener('click',()=>overlay.remove());
+  overlay.querySelector('#saveExamBtn').addEventListener('click', async ()=>{
+    const title = document.getElementById('examTitle').value.trim();
+    const date = document.getElementById('examDate').value || todayStr();
+    if(!title){ alert('اكتب اسم الامتحان'); return; }
+    const rows = document.querySelectorAll('#examQuestions > div');
+    if(rows.length===0){ alert('لازم تضيف سؤال واحد على الأقل.'); return; }
+    const questions = [];
+    for(const row of rows){
+      const qtext = row.querySelector('[data-qtext]').value.trim();
+      const optionInputs = Array.from(row.querySelectorAll('[data-option]'));
+      const options = optionInputs.map(o=>o.value.trim());
+      const filledCount = options.filter(o=>o!=='').length;
+      const correctRadio = row.querySelector('[data-correct-radio]:checked');
+      if(!qtext || filledCount<2 || !correctRadio){
+        alert('كل سؤال لازم يكون ليه نص، اختيارين على الأقل، وعلامة صح على الإجابة الصحيحة.');
+        return;
+      }
+      const correctIndex = Number(correctRadio.value);
+      if(options[correctIndex]===''){ alert('الإجابة المُحددة كصح فاضية في أحد الأسئلة، راجعها.'); return; }
+      questions.push({ text: qtext, options, correctIndex });
+    }
+
+    const btn = document.getElementById('saveExamBtn');
+    btn.disabled = true; btn.textContent='جارِ الحفظ...';
+    try{
+      const token = genPortalToken();
+      const a = { id:uid(), groupId:gradesState.groupId, title, maxScore:questions.length, date, isOnline:true, examToken:token };
+      state.assessments.push(a);
+      await sSet('assessments', state.assessments);
+      const groupStudents = studentsOf(gradesState.groupId);
+      await db.collection('exam_public').doc(token).set({
+        assessmentId: a.id,
+        groupId: a.groupId,
+        groupName: groupName(a.groupId),
+        title,
+        questions,
+        students: groupStudents.map(s=>({id:s.id, name:s.name})),
+        createdAt: Date.now()
+      });
+      gradesState.openAssessment = a.id;
+      overlay.remove();
+      renderMain();
+    }catch(e){
+      console.error(e);
+      alert('حصلت مشكلة أثناء نشر الامتحان، تأكد من الإنترنت وحاول تاني.');
+      btn.disabled=false; btn.textContent='حفظ ونشر الامتحان';
+    }
+  });
+}
+
+async function syncExamSubmissions(a){
+  if(!a.isOnline || !a.examToken) return { count:0 };
+  try{
+    const snap = await db.collection('exam_submissions').where('token','==',a.examToken).get();
+    const byStudent = {};
+    snap.docs.forEach(d=>{
+      const data = d.data();
+      const existing = byStudent[data.studentId];
+      if(!existing || (data.submittedAt||0) < (existing.submittedAt||0)){ byStudent[data.studentId] = data; }
+    });
+    const scores = (await sGet(`scores:${a.id}`)) || {};
+    let changed = false;
+    Object.keys(byStudent).forEach(sid=>{
+      if(scores[sid] === undefined || scores[sid] === null || scores[sid] === ''){
+        scores[sid] = byStudent[sid].score; changed = true;
+      }
+    });
+    if(changed) await sSet(`scores:${a.id}`, scores);
+    return { count: Object.keys(byStudent).length };
+  }catch(e){ console.error('exam sync failed', e); return { count:0 }; }
+}
+
 async function renderScoreEntry(){
   const container = document.getElementById('scoreEntry');
   const a = state.assessments.find(x=>x.id===gradesState.openAssessment);
   if(!a){ container.innerHTML=''; return; }
   const list = studentsOf(a.groupId);
+
+  if(a.isOnline){
+    container.innerHTML = `<div class="card"><div class="loading">جارِ مزامنة نتائج الامتحان...</div></div>`;
+    await syncExamSubmissions(a);
+  }
+  if(gradesState.openAssessment !== a.id) return; // stale guard
+
   const scores = (await sGet(`scores:${a.id}`)) || {};
+  const answeredCount = Object.keys(scores).length;
+  const examLink = a.isOnline ? `${location.origin}${location.pathname.replace(/index\.html$/,'')}exam.html?t=${a.examToken}` : null;
+
   container.innerHTML = `
     <div class="card">
       <h3 style="color:var(--accent); margin-bottom:12px;">درجات: ${a.title} <span style="font-size:12px;color:var(--muted);font-weight:400;">(من ${a.maxScore})</span></h3>
+      ${a.isOnline ? `
+      <div class="report-meta" style="margin-bottom:10px;">🖥️ امتحان إلكتروني — الدرجات بتتحدّث تلقائي كل ما تفتح الصفحة دي. حلّ لحد دلوقتي: ${answeredCount} من ${list.length}</div>
+      <div style="direction:ltr; text-align:left; word-break:break-all; font-size:12.5px; background:var(--field-bg); padding:8px 10px; border-radius:8px; margin-bottom:8px;">${examLink}</div>
+      <div class="row" style="margin-bottom:14px;">
+        <button class="btn btn-ghost btn-sm" id="copyExamLink">📋 نسخ لينك الامتحان</button>
+        <button class="btn btn-ghost btn-sm" id="refreshExamSync">🔄 تحديث النتائج دلوقتي</button>
+      </div>` : ''}
       <table>
         <thead><tr><th>الطالب</th><th>الدرجة</th></tr></thead>
         <tbody>
@@ -1894,6 +2038,15 @@ async function renderScoreEntry(){
     </div>
   `;
   document.getElementById('closeScores').addEventListener('click',()=>{ gradesState.openAssessment=null; renderMain(); });
+  document.getElementById('copyExamLink')?.addEventListener('click', async ()=>{
+    const ok = await copyTextToClipboard(examLink);
+    alert(ok? 'تم نسخ اللينك.' : 'تعذّر النسخ التلقائي.');
+  });
+  document.getElementById('refreshExamSync')?.addEventListener('click', async (e)=>{
+    const btn = e.target; btn.disabled=true; btn.textContent='جارِ التحديث...';
+    await syncExamSubmissions(a);
+    renderScoreEntry();
+  });
   document.getElementById('saveScores').addEventListener('click', async ()=>{
     const inputs = container.querySelectorAll('input[data-sid]');
     const newScores = {};
