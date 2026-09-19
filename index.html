@@ -2473,10 +2473,11 @@ async function buildReportBody(){
     alert(ok? 'تم نسخ الرسالة، تقدر تلصقها في واتساب.' : 'تعذّر النسخ التلقائي، انسخ النص يدويًا.');
   });
   document.getElementById('waSendBtn').addEventListener('click', async ()=>{
+    const win = window.open('', '_blank'); // open synchronously on the click to avoid popup blocking
     const text = encodeURIComponent(await buildWaText());
     const phone = normalizePhoneForWa(student.parentPhone);
     const url = phone? `https://wa.me/${phone}?text=${text}` : `https://wa.me/?text=${text}`;
-    window.open(url, '_blank');
+    if(win){ win.location.href = url; } else { window.open(url, '_blank'); }
     await logMessage({ studentId:student.id, studentName:student.name, groupId:student.groupId, groupName:groupName(student.groupId), type:'report', detail:periodLabel(period) });
   });
 }
@@ -3015,6 +3016,7 @@ function renderBulkBody(){
     btn.addEventListener('click', async ()=>{
       const student = list.find(s=>s.id===btn.dataset.waOpen);
       const phone = normalizePhoneForWa(student.parentPhone);
+      const win = window.open('', '_blank'); // open synchronously on the click to avoid popup blocking
       let personalized;
       if(bulkState.mode==='report'){
         btn.disabled = true; const oldLabel = btn.textContent; btn.textContent = 'جارِ التجهيز...';
@@ -3024,7 +3026,8 @@ function renderBulkBody(){
         const rawMsg = document.getElementById('bulkMessage').value || '';
         personalized = rawMsg.replace(/\{name\}/g, student.name);
       }
-      window.open(`https://wa.me/${phone}?text=${encodeURIComponent(personalized)}`, '_blank');
+      const url = `https://wa.me/${phone}?text=${encodeURIComponent(personalized)}`;
+      if(win){ win.location.href = url; } else { window.open(url, '_blank'); }
       bulkState.statuses[student.id] = 'opened';
       await logMessage({
         studentId:student.id, studentName:student.name, groupId:student.groupId, groupName:groupName(student.groupId),
