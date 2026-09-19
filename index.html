@@ -14,9 +14,6 @@
 <link rel="icon" href="icon-192.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@600;700;800;900&family=Tajawal:wght@400;500;700&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
@@ -477,6 +474,32 @@ async function sDelete(key){
   catch(e){ console.error(e); return false; }
 }
 
+// ================= LAZY-LOADED LIBRARIES (loaded on demand, not on startup) =================
+const _libLoadPromises = {};
+function loadScriptOnce(url){
+  if(_libLoadPromises[url]) return _libLoadPromises[url];
+  _libLoadPromises[url] = new Promise((resolve, reject)=>{
+    const s = document.createElement('script');
+    s.src = url;
+    s.onload = ()=>resolve();
+    s.onerror = ()=>{ delete _libLoadPromises[url]; reject(new Error('تعذّر تحميل المكتبة من: '+url)); };
+    document.head.appendChild(s);
+  });
+  return _libLoadPromises[url];
+}
+function ensureQRCodeLib(){
+  if(window.QRCode) return Promise.resolve();
+  return loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js');
+}
+function ensureJsQRLib(){
+  if(window.jsQR) return Promise.resolve();
+  return loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.js');
+}
+function ensureXLSXLib(){
+  if(window.XLSX) return Promise.resolve();
+  return loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js');
+}
+
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,8); }
 function genPortalToken(){
   if(window.crypto && crypto.getRandomValues){
@@ -758,7 +781,7 @@ async function computeDashboardData(){
 }
 
 async function exportExcel(){
-  if(typeof XLSX==='undefined'){ alert('تعذّر تحميل مكتبة Excel، تأكد من اتصال الإنترنت وحاول تاني.'); return; }
+  try{ await ensureXLSXLib(); }catch(e){ alert('تعذّر تحميل مكتبة Excel، تأكد من اتصال الإنترنت وحاول تاني.'); return; }
 
   const studentsRows = state.students.map(s=>({
     'الاسم': s.name,
@@ -1162,7 +1185,8 @@ async function deleteStudent(id){
 function qrTextFor(student){ return `TNB-STU:${student.id}`; }
 
 // Renders a QR code into a plain (non-attached) div and resolves with its dataURL.
-function renderQrDataUrl(text){
+async function renderQrDataUrl(text){
+  try{ await ensureQRCodeLib(); }catch(e){ return null; }
   return new Promise((resolve)=>{
     const tmp = document.createElement('div');
     tmp.style.position='fixed'; tmp.style.left='-9999px'; tmp.style.top='-9999px';
@@ -1696,6 +1720,7 @@ async function openQrScanModal(){
 
   const statusEl = document.getElementById('qrStatus');
   const video = document.getElementById('qrVideo');
+  ensureJsQRLib().catch(()=>{ statusEl.textContent = 'تعذّر تحميل مكتبة قراءة QR، تأكد من الإنترنت. تقدر تستخدم الإدخال اليدوي.'; });
   try{
     if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
       throw new Error('no-camera-api');
