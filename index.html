@@ -414,6 +414,7 @@ const ICONS = {
   payments: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="13" rx="2"/><path d="M2 10h20"/><path d="M6 15h4"/></svg>',
   bulk: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 12a4 4 0 108 0 4 4 0 00-8 0z"/><path d="M2 20c0-3.3 2.7-6 6-6M22 20c0-3.3-2.7-6-6-6"/><path d="M2 20h20"/></svg>',
   attendanceSheet: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 2h6a1 1 0 011 1v2H8V3a1 1 0 011-1z"/><path d="M8 4H6a2 2 0 00-2 2v14a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-2"/><path d="M9 12l2 2 4-4"/></svg>',
+  absenceControl: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M8 8l8 8M16 8l-8 8"/></svg>',
   msglog: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>'
 };
 const GROUP_COLORS = ['#D9A94E','#4FA8E0','#2FD9A8','#E2604A','#B08CE0','#5AD1E0'];
@@ -547,11 +548,15 @@ let state = {
 };
 
 async function loadCore(){
-  state.groups = (await sGet('groups')) || [];
-  state.students = (await sGet('students')) || [];
-  state.assessments = (await sGet('assessments')) || [];
-  state.homeworkList = (await sGet('homeworkList')) || [];
-  state.msgLog = (await sGet('msgLog')) || [];
+  // Load the five core records in parallel instead of waiting for each request in sequence.
+  const [groups, students, assessments, homeworkList, msgLog] = await Promise.all([
+    sGet('groups'), sGet('students'), sGet('assessments'), sGet('homeworkList'), sGet('msgLog')
+  ]);
+  state.groups = groups || [];
+  state.students = students || [];
+  state.assessments = assessments || [];
+  state.homeworkList = homeworkList || [];
+  state.msgLog = msgLog || [];
   state.loaded = true;
 }
 
@@ -583,6 +588,7 @@ function render(){
         ${navItem('students','الطلاب','students')}
         ${navItem('attendance','الحضور والغياب','attendance')}
         ${navItem('attendanceSheet','كشف الحضور','attendanceSheet')}
+        ${navItem('absenceControl','حصر الغياب ٤ حصص','absenceControl')}
         ${navItem('grades','الدرجات','grades')}
         ${navItem('homework','الواجبات','homework')}
         ${navItem('report','تقرير الطالب','report')}
@@ -648,6 +654,7 @@ async function renderMain(){
   if(state.tab==='profile') return renderProfile(main);
   if(state.tab==='attendance') return renderAttendance(main);
   if(state.tab==='attendanceSheet') return renderAttendanceSheet(main);
+  if(state.tab==='absenceControl') return renderAbsenceControl(main);
   if(state.tab==='grades') return renderGrades(main);
   if(state.tab==='homework') return renderHomework(main);
   if(state.tab==='report') return renderReport(main);
@@ -1034,6 +1041,15 @@ async function deleteGroup(groupId){
 
 // ================= STUDENTS =================
 let studentFilterGroup = 'all';
+let studentSearchQuery = '';
+// توحيد النص العربي للبحث: يتجاهل التشكيل والهمزات والتاء المربوطة والياء/الألف المقصورة
+function normSearch(t){
+  return String(t||'').toLowerCase()
+    .replace(/[\u064B-\u065F\u0670\u0640]/g,'')
+    .replace(/[أإآٱ]/g,'ا').replace(/ة/g,'ه').replace(/ى/g,'ي')
+    .replace(/[٠-٩]/g, d=>'٠١٢٣٤٥٦٧٨٩'.indexOf(d))
+    .replace(/\s+/g,' ').trim();
+}
 function renderStudents(main){
   main.innerHTML = `
     <div class="topbar">
@@ -1044,6 +1060,9 @@ function renderStudents(main){
     <div class="pillbar" id="filterPills">
       <div class="pill ${studentFilterGroup==='all'?'active':''}" data-f="all">الكل (${state.students.length})</div>
       ${state.groups.map(g=>`<div class="pill ${studentFilterGroup===g.id?'active':''}" data-f="${g.id}">${g.name} (${studentsOf(g.id).length})</div>`).join('')}
+    </div>
+    <div class="row" style="margin-bottom:12px;">
+      <input id="studentSearch" type="search" value="${studentSearchQuery.replace(/"/g,'&quot;')}" placeholder="🔍 ابحث بالاسم أو رقم ولي الأمر أو المدرسة..." style="flex:1; min-width:200px;">
     </div>
     <div class="row" style="margin-bottom:12px;">
       <button class="btn btn-ghost btn-sm" id="printQrBtn">🖨️ طباعة بطاقات QR للقائمة الحالية</button>
@@ -1061,14 +1080,30 @@ function renderStudents(main){
   document.querySelectorAll('#filterPills .pill').forEach(p=>{
     p.addEventListener('click',()=>{ studentFilterGroup = p.dataset.f; renderStudents(main); });
   });
-  const list = studentFilterGroup==='all'? state.students : studentsOf(studentFilterGroup);
-  document.getElementById('printQrBtn').addEventListener('click',()=>printQrCards(list));
+  const getList = ()=>{
+    const base = studentFilterGroup==='all'? state.students : studentsOf(studentFilterGroup);
+    const q = normSearch(studentSearchQuery);
+    if(!q) return base;
+    return base.filter(s=>
+      normSearch(s.name).includes(q) ||
+      normSearch(s.parentPhone).includes(q) ||
+      normSearch(s.school).includes(q)
+    );
+  };
+  document.getElementById('printQrBtn').addEventListener('click',()=>printQrCards(getList()));
   const tbody = document.querySelector('#studentsTable tbody');
   const emptyDiv = document.getElementById('studentsEmpty');
-  if(list.length===0){
-    document.getElementById('studentsTable').style.display='none';
-    emptyDiv.innerHTML = `<div class="empty">مفيش طلاب هنا لسه.</div>`;
-  } else {
+  const drawRows = ()=>{
+    const list = getList();
+    const searching = normSearch(studentSearchQuery) !== '';
+    if(list.length===0){
+      document.getElementById('studentsTable').style.display='none';
+      emptyDiv.innerHTML = `<div class="empty">${searching? 'مفيش طالب بالاسم ده.' : 'مفيش طلاب هنا لسه.'}</div>`;
+      tbody.innerHTML = '';
+      return;
+    }
+    document.getElementById('studentsTable').style.display='';
+    emptyDiv.innerHTML = searching ? `<div style="color:var(--muted);font-size:12px;margin-top:8px;">${list.length} نتيجة</div>` : '';
     tbody.innerHTML = list.map(s=>`
       <tr>
         <td style="font-weight:700;"><span class="student-link" data-view="${s.id}">${s.name}</span></td>
@@ -1085,7 +1120,12 @@ function renderStudents(main){
     }));
     tbody.querySelectorAll('[data-edit]').forEach(b=>b.addEventListener('click',()=>openStudentModal(b.dataset.edit)));
     tbody.querySelectorAll('[data-del]').forEach(b=>b.addEventListener('click',()=>deleteStudent(b.dataset.del)));
-  }
+  };
+  document.getElementById('studentSearch').addEventListener('input', e=>{
+    studentSearchQuery = e.target.value;
+    drawRows();
+  });
+  drawRows();
 }
 
 async function openStudentModal(studentId){
@@ -1172,13 +1212,20 @@ async function openStudentModal(studentId){
   });
 }
 
-async function deleteStudent(id){
-  if(currentRole==='secretary'){ alert('حذف الطلاب متاح للمدرّس بس — كلّم د. طارق لو محتاجة تحذفي طالب.'); return; }
-  if(!confirm('حذف الطالب ده؟')) return;
+async function deleteStudent(id, confirmMessage, skipConfirm=false){
+  if(currentRole==='secretary'){ alert('حذف الطلاب متاح للمدرّس بس — كلّم د. طارق لو محتاجة تحذفي طالب.'); return false; }
+  if(!skipConfirm && !confirm(confirmMessage || 'حذف الطالب ده؟')) return false;
+  const removed = state.students.find(s=>s.id===id);
   state.students = state.students.filter(s=>s.id!==id);
   await sSet('students', state.students);
   await sDelete(`photo:${id}`);
+  // امسح تقرير بوابة ولي الأمر عشان الرابط القديم يقف
+  if(removed && removed.portalToken){
+    try{ await db.collection('portal_reports').doc(removed.portalToken).delete(); }
+    catch(e){ console.error('portal report delete failed', e); }
+  }
   renderMain();
+  return true;
 }
 
 // ================= STUDENT QR CODES =================
@@ -1556,6 +1603,7 @@ async function renderProfile(main){
 }
 
 // ================= ATTENDANCE =================
+let attSearchQuery = '';
 let attState = { groupId:null, date: todayStr(), records:{}, sessionDates:[] };
 async function renderAttendance(main){
   if(state.groups.length===0){
@@ -1580,6 +1628,9 @@ async function renderAttendance(main){
     <div class="row" style="margin-bottom:16px;">
       <button class="btn btn-gold" id="openQrScanBtn">📷 تسجيل حضور بمسح QR</button>
     </div>
+    <div class="row" style="margin-bottom:12px;">
+      <input id="attSearch" type="search" value="${attSearchQuery.replace(/"/g,'&quot;')}" placeholder="🔍 ابحث عن طالب في المجموعة..." style="flex:1; min-width:200px;">
+    </div>
     <div class="card" id="attCard"></div>
     <div class="card">
       <h3 style="color:var(--accent); margin-bottom:8px; font-size:15px;">جلسات سابقة</h3>
@@ -1587,12 +1638,13 @@ async function renderAttendance(main){
     </div>
   `;
   document.getElementById('attGroup').addEventListener('change', async (e)=>{
-    attState.groupId = e.target.value; await loadAttSession(); renderAttendance(main);
+    attState.groupId = e.target.value; attSearchQuery = ''; await loadAttSession(); renderAttendance(main);
   });
   document.getElementById('attDate').addEventListener('change', async (e)=>{
     attState.date = e.target.value; await loadAttSession(); renderAttendance(main);
   });
   document.getElementById('openQrScanBtn').addEventListener('click', openQrScanModal);
+  document.getElementById('attSearch').addEventListener('input', e=>{ attSearchQuery = e.target.value; renderAttCard(); });
   await loadAttSession();
   await renderAttCard();
   await renderSessionHistory();
@@ -1605,10 +1657,12 @@ async function loadAttSession(){
 
 async function renderAttCard(){
   const card = document.getElementById('attCard');
-  const list = studentsOf(attState.groupId);
-  if(list.length===0){ card.innerHTML = `<div class="empty">مفيش طلاب في المجموعة دي.</div>`; return; }
+  const allStudents = studentsOf(attState.groupId);
+  if(allStudents.length===0){ card.innerHTML = `<div class="empty">مفيش طلاب في المجموعة دي.</div>`; return; }
+  const aq = normSearch(attSearchQuery);
+  const list = aq ? allStudents.filter(s=>normSearch(s.name).includes(aq)) : allStudents;
   card.innerHTML = `
-    ${list.map(s=>{
+    ${list.length===0 ? `<div class="empty">مفيش طالب بالاسم ده.</div>` : list.map(s=>{
       const st = attState.records[s.id] || null;
       return `<div class="stamp-row">
         <div class="stamp-name">${s.name}</div>
@@ -2568,6 +2622,133 @@ function renderMsgLogBody(){
 // ================= ATTENDANCE SHEET (كشف حضور قابل للطباعة) =================
 let sheetState = { groupId:null, cycle:null };
 
+// ================= ABSENCE CONTROL: 4 CONSECUTIVE SESSIONS =================
+let absenceControlState = { groupId: 'all' };
+let absenceSearchQuery = '';
+
+async function getAbsenceControlRows(groupId='all'){
+  const groups = groupId==='all' ? state.groups : state.groups.filter(g=>g.id===groupId);
+  const output = [];
+  for(const group of groups){
+    const keys = await sList(`attendance:${group.id}:`);
+    const dates = keys.map(k=>k.split(':')[2]).filter(Boolean).sort();
+    // Only evaluate the latest four saved sessions for each group.
+    if(dates.length < 4) continue;
+    const lastFourDates = dates.slice(-4);
+    const lastFourRecords = await Promise.all(lastFourDates.map(async date=>
+      (await sGet(`attendance:${group.id}:${date}`)) || {}
+    ));
+    const allRecords = await Promise.all(dates.map(async date=>
+      (await sGet(`attendance:${group.id}:${date}`)) || {}
+    ));
+    const groupStudents = studentsOf(group.id);
+    for(const student of groupStudents){
+      const lastFourStatuses = lastFourRecords.map(record=>record[student.id] || null);
+      // A student qualifies only when marked absent in every one of the last four sessions.
+      if(lastFourStatuses.every(status=>status==='absent')){
+        const totalAbsences = allRecords.reduce((count, record)=>count+(record[student.id]==='absent'?1:0),0);
+        output.push({
+          student,
+          group,
+          lastFourDates,
+          consecutiveAbsences: 4,
+          totalAbsences
+        });
+      }
+    }
+  }
+  return output.sort((a,b)=>a.group.name.localeCompare(b.group.name,'ar') || a.student.name.localeCompare(b.student.name,'ar'));
+}
+
+async function renderAbsenceControl(main){
+  main.innerHTML = `
+    <div class="topbar">
+      <div><div class="tabtitle">حصر الطلاب المتغيبين</div><div class="tabsub">يظهر الطالب إذا كان غائبًا في آخر ٤ حصص مسجّلة للمجموعة دون انقطاع.</div></div>
+      <button class="btn btn-ghost" id="refreshAbsenceList">↻ تحديث القائمة</button>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between; margin-bottom:12px;">
+        <div>
+          <label class="field-label" for="absenceGroupFilter">تصفية حسب المجموعة</label>
+          <select id="absenceGroupFilter">
+            <option value="all" ${absenceControlState.groupId==='all'?'selected':''}>كل المجموعات</option>
+            ${state.groups.map(g=>`<option value="${g.id}" ${absenceControlState.groupId===g.id?'selected':''}>${g.name}</option>`).join('')}
+          </select>
+        </div>
+        <div style="color:var(--muted);font-size:12px;max-width:360px;line-height:1.7;">
+          الحصر يعتمد على آخر أربع حصص محفوظة لكل مجموعة. الحصة التي لم يُسجّل فيها حضور أو غياب للطالب لا تُحسب كغياب.
+        </div>
+      </div>
+      <input id="absenceSearch" type="search" value="${absenceSearchQuery.replace(/"/g,'&quot;')}" placeholder="🔍 ابحث عن طالب في القائمة..." style="width:100%; margin-bottom:12px;">
+      <div id="absenceControlBody"><div class="loading"><div class="spinner"></div>جارٍ حصر الغياب...</div></div>
+    </div>
+  `;
+  const body = document.getElementById('absenceControlBody');
+  let cachedRows = null;
+  const loadRows = async (refetch=true)=>{
+    if(refetch || !cachedRows){
+      body.innerHTML = `<div class="loading"><div class="spinner"></div>جارٍ حصر الغياب...</div>`;
+      cachedRows = await getAbsenceControlRows(absenceControlState.groupId);
+    }
+    const rows = cachedRows;
+    if(!document.getElementById('absenceControlBody')) return;
+    const aq = normSearch(absenceSearchQuery);
+    const shown = aq ? rows.filter(r=>normSearch(r.student.name).includes(aq)) : rows;
+    if(rows.length===0){
+      body.innerHTML = `<div class="empty">لا يوجد طلاب غائبون عن آخر ٤ حصص مسجّلة متتالية حسب البيانات الحالية.</div>`;
+      return;
+    }
+    const suspiciousGroups = state.groups.filter(g=>{
+      const total = studentsOf(g.id).length;
+      const flagged = rows.filter(r=>r.group.id===g.id).length;
+      return total>=3 && flagged/total > 0.5;
+    });
+    const warnHtml = suspiciousGroups.length ? `
+      <div style="background:var(--absent-soft);border:1px solid var(--absent);border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:13px;line-height:1.7;">
+        ⚠️ أكتر من نصف طلاب (${suspiciousGroups.map(g=>g.name).join('، ')}) ظهروا غايبين. ممكن تكون إجازة أو حصة اتسجلت بالغلط — راجع سجل الحضور قبل ما تحذف.
+      </div>` : '';
+    body.innerHTML = `
+      ${warnHtml}
+      <div class="dash-stats-row">
+        <div class="dash-stat absent"><div class="num">${rows.length}</div><div class="lbl">طلاب مستوفون لشرط الغياب</div></div>
+      </div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>اسم الطالب</th><th>المجموعة</th><th>الغياب في آخر ٤ حصص</th><th>إجمالي الغياب المسجّل</th><th>الإجراء</th></tr></thead>
+          <tbody>
+            ${shown.length===0 ? `<tr><td colspan="5" style="text-align:center;color:var(--muted);">مفيش طالب بالاسم ده.</td></tr>` : shown.map(row=>`<tr>
+              <td style="font-weight:800;">${row.student.name}</td>
+              <td>${row.group.name}</td>
+              <td><span class="badge badge-absent">${row.consecutiveAbsences} من ٤</span></td>
+              <td>${row.totalAbsences} حصة</td>
+              <td>${currentRole==='teacher'
+                ? `<button class="btn btn-danger btn-sm" data-remove-absent="${row.student.id}">حذف الطالب</button>`
+                : `<span style="color:var(--muted);font-size:12px;">الحذف للمدرّس فقط</span>`}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+      <div style="margin-top:12px;color:var(--muted);font-size:12px;line-height:1.7;">ملاحظة: الحذف يزيل الطالب من قائمة الطلاب وصورته فقط، ولا يحذف سجلات الحضور التاريخية أو بقية بياناته المحفوظة في Firebase.</div>
+    `;
+    body.querySelectorAll('[data-remove-absent]').forEach(button=>{
+      button.addEventListener('click', async ()=>{
+        const student = state.students.find(s=>s.id===button.dataset.removeAbsent);
+        if(!student) { alert('لم يتم العثور على الطالب. حدّث القائمة وحاول مرة أخرى.'); return; }
+        const confirmed = confirm(`تأكيد حذف الطالب: ${student.name}\nالمجموعة: ${groupName(student.groupId)}\nالطالب غائب عن آخر ٤ حصص مسجّلة.\n\nسيتم حذفه من قائمة الطلاب فقط، مع الإبقاء على سجلات الحضور التاريخية. هل تريد المتابعة؟`);
+        if(!confirmed) return;
+        await deleteStudent(student.id, '', true); // بتعمل renderMain بنفسها
+      });
+    });
+  };
+  document.getElementById('absenceGroupFilter').addEventListener('change', async e=>{
+    absenceControlState.groupId = e.target.value;
+    await loadRows();
+  });
+  document.getElementById('refreshAbsenceList').addEventListener('click', ()=>loadRows(true));
+  document.getElementById('absenceSearch').addEventListener('input', e=>{ absenceSearchQuery = e.target.value; loadRows(false); });
+  await loadRows();
+}
+
 async function renderAttendanceSheet(main){
   if(state.groups.length===0){
     main.innerHTML = `<div class="topbar"><div class="tabtitle">كشف الحضور</div></div><div class="empty">لازم تضيف مجموعة وطلاب الأول.</div>`;
@@ -3251,16 +3432,43 @@ function logout(){
 }
 
 // ---------- boot ----------
+let appBootFinished = false;
+function showBootError(message){
+  const app = document.getElementById('app');
+  if(!app) return;
+  app.innerHTML = `
+    <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;">
+      <div class="card" style="max-width:420px;width:100%;text-align:center;">
+        <div style="font-size:22px;margin-bottom:8px;">تعذّر فتح الأداة</div>
+        <div style="color:var(--muted);line-height:1.8;margin-bottom:16px;">${message}</div>
+        <button class="btn btn-gold" id="retryBootBtn" style="justify-content:center;width:100%;">إعادة المحاولة</button>
+      </div>
+    </div>`;
+  document.getElementById('retryBootBtn')?.addEventListener('click', ()=>location.reload());
+}
 auth.onAuthStateChanged(async (user)=>{
-  if(user){
-    currentRole = (user.email===SECRETARY_EMAIL) ? 'secretary' : 'teacher';
-    if(currentRole==='secretary' && state.tab==='payments') state.tab='home';
-    await loadCore();
-    render();
-  } else {
-    showLoginScreen();
+  try{
+    if(user){
+      currentRole = (user.email===SECRETARY_EMAIL) ? 'secretary' : 'teacher';
+      if(currentRole==='secretary' && state.tab==='payments') state.tab='home';
+      await loadCore();
+      render();
+    } else {
+      showLoginScreen();
+    }
+    appBootFinished = true;
+  }catch(err){
+    console.error('App startup failed:', err);
+    appBootFinished = true;
+    showBootError('حصلت مشكلة أثناء الاتصال أو تجهيز البيانات. تأكد من الإنترنت ثم اضغط إعادة المحاولة. لم يتم حذف أو تعديل أي بيانات.');
   }
 });
+// Avoid leaving the initial spinner forever if Firebase does not finish initializing.
+setTimeout(()=>{
+  if(!appBootFinished && document.querySelector('#app > .loading')){
+    showBootError('الاتصال بخدمة تسجيل الدخول أو Firebase استغرق وقتًا أطول من المتوقع. تأكد من الإنترنت، وإذا تكررت المشكلة افحص إعدادات Firebase أو سجّل الخطأ الظاهر في Console.');
+  }
+}, 15000);
 
 // ---------- PWA: register service worker (offline app shell + installable) ----------
 if('serviceWorker' in navigator){
