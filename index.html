@@ -752,14 +752,16 @@ async function computeDashboardData(){
     }
 
     if(currentRole==='teacher'){
-      const currentCycle = Math.max(1, Math.ceil(dates.length/4) || 1);
-      const cycleDates = dates.slice((currentCycle-1)*4, currentCycle*4);
-      if(cycleDates.length===4){
-        const paymentRecs = await Promise.all(groupStudents.map(s=> sGet(`payment:${s.id}:${currentCycle}`)));
-        groupStudents.forEach((s,i)=>{
-          const rec = paymentRecs[i];
-          if(!rec || !rec.paid){
-            groupAlerts.push({level:'yellow', icon:'💰', text:`${s.name} خلّص الشهر ${currentCycle} ولسه ما دفعش — ${g.name}`});
+      const gInfo = { dates:[...dates].sort() };
+      const cur = Math.max(1, Math.ceil(gInfo.dates.length/4) || 1);
+      const toCheck = [];
+      if(gInfo.dates.slice((cur-1)*4, cur*4).length===4) toCheck.push(cur);
+      if(cur>1) toCheck.push(cur-1);
+      for(const c of toCheck){
+        const { rows } = await getCycleRows(g.id, c, gInfo);
+        rows.forEach(r=>{
+          if(r.share>0 && !r.rec.paid){
+            groupAlerts.push({level:'yellow', icon:'💰', text:`${r.student.name} خلّص الشهر ${c} (${shareLabel(r.share)}) ولسه ما دفعش ${r.due} ج — ${g.name}`});
           }
         });
       }
@@ -820,19 +822,22 @@ async function exportExcel(){
   for(const g of state.groups){
     const groupStudents = studentsOf(g.id);
     if(groupStudents.length===0) continue;
-    const { currentCycle } = await getGroupCycleInfo(g.id);
-    for(const s of groupStudents){
-      for(let c=1;c<=currentCycle;c++){
-        const rec = await sGet(`payment:${s.id}:${c}`);
+    const gInfo = await getGroupCycleInfo(g.id);
+    for(let c=1;c<=gInfo.currentCycle;c++){
+      const { rows } = await getCycleRows(g.id, c, gInfo);
+      rows.forEach(r=>{
+        if(r.share===0) return;
         paymentRows.push({
           'المجموعة': g.name,
-          'الطالب': s.name,
+          'الطالب': r.student.name,
           'الشهر (الدورة)': c,
-          'الحالة': rec && rec.paid ? 'مدفوع' : 'غير مدفوع',
-          'المبلغ': rec && rec.paid ? (rec.amount!=null? rec.amount : (s.monthlyFee||'')) : '',
-          'التاريخ': rec && rec.paid && rec.date ? rec.date : ''
+          'عدد الحصص': r.share,
+          'المستحق': r.due,
+          'الحالة': r.rec.paid ? 'مدفوع' : 'غير مدفوع',
+          'المدفوع': r.rec.paid ? r.paidAmt : '',
+          'التاريخ': r.rec.paid && r.rec.date ? r.rec.date : ''
         });
-      }
+      });
     }
   }
 
@@ -949,12 +954,63 @@ async function renderHome(main){
 
   const alertsCard = document.getElementById('alertsCard');
   if(alertsCard){
-    alertsCard.innerHTML = `
-      <h3 style="color:var(--accent); margin-bottom:10px;">🔔 التنبيهات</h3>
-      ${data.alerts.length===0? `<div class="empty">مفيش تنبيهات دلوقتي، تمام 👌</div>` :
-        data.alerts.map(a=>`<div class="alert-item ${a.level}"><span class="alert-icon">${a.icon}</span><span>${a.text}</span></div>`).join('')}
-    `;
+    let dismissed = await loadDismissedAlerts();
+    // نشيل من المحذوفات أي تنبيه الحالة بتاعته خلصت (عشان لو رجع تاني يظهر من جديد)
+    const activeTexts = new Set(data.alerts.map(a=>a.text));
+    const pruned = {};
+    Object.keys(dismissed).forEach(t=>{ if(activeTexts.has(t)) pruned[t]=dismissed[t]; });
+    if(Object.keys(pruned).length !== Object.keys(dismissed).length){ dismissed = pruned; await saveDismissedAlerts(dismissed); }
+
+    const draw = ()=>{
+      const visible = data.alerts.filter(a=>!dismissed[a.text]);
+      const hiddenCount = data.alerts.length - visible.length;
+      alertsCard.innerHTML = `
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:10px;">
+          <h3 style="color:var(--accent); margin:0;">🔔 التنبيهات</h3>
+          ${visible.length? `<button class="btn btn-ghost btn-sm" id="clearAlertsBtn">🗑️ مسح الكل</button>` : ''}
+        </div>
+        ${visible.length===0? `<div class="empty">مفيش تنبيهات دلوقتي، تمام 👌</div>` :
+          visible.map((a,i)=>`<div class="alert-item ${a.level}"><span class="alert-icon">${a.icon}</span><span style="flex:1;">${a.text}</span><button data-dismiss="${i}" title="حذف التنبيه" style="background:none;border:none;color:inherit;font-size:18px;cursor:pointer;opacity:.7;padding:0 4px;">✕</button></div>`).join('')}
+        ${hiddenCount? `<div style="margin-top:10px;"><button class="btn btn-ghost btn-sm" id="restoreAlertsBtn">↩︎ إظهار التنبيهات المحذوفة (${hiddenCount})</button></div>` : ''}
+      `;
+      alertsCard.querySelectorAll('[data-dismiss]').forEach(b=>{
+        b.addEventListener('click', async ()=>{
+          const a = visible[Number(b.dataset.dismiss)];
+          dismissed[a.text] = Date.now();
+          await saveDismissedAlerts(dismissed);
+          draw();
+        });
+      });
+      const clr = document.getElementById('clearAlertsBtn');
+      if(clr) clr.addEventListener('click', async ()=>{
+        if(!confirm('تمسح كل التنبيهات الحالية؟ (هتظهر تاني بس لو حصل تنبيه جديد)')) return;
+        visible.forEach(a=>{ dismissed[a.text] = Date.now(); });
+        await saveDismissedAlerts(dismissed);
+        draw();
+      });
+      const rst = document.getElementById('restoreAlertsBtn');
+      if(rst) rst.addEventListener('click', async ()=>{
+        dismissed = {};
+        await saveDismissedAlerts(dismissed);
+        draw();
+      });
+    };
+    draw();
   }
+}
+
+// تنبيهات اتحذفت: المدرس بيتخزن على Firestore (يتزامن بين الأجهزة)، السكرتيرة على الجهاز نفسه
+async function loadDismissedAlerts(){
+  try{
+    if(currentRole==='teacher'){ return (await sGet('dismissed_alerts')) || {}; }
+    return JSON.parse(localStorage.getItem('dismissed_alerts') || '{}');
+  }catch(e){ return {}; }
+}
+async function saveDismissedAlerts(map){
+  try{
+    if(currentRole==='teacher'){ await sSet('dismissed_alerts', map); }
+    else { localStorage.setItem('dismissed_alerts', JSON.stringify(map)); }
+  }catch(e){ console.error(e); }
 }
 
 // ================= GROUPS =================
@@ -1169,6 +1225,10 @@ async function openStudentModal(studentId){
         <label class="field-label">رسوم الشهر (كل 4 حصص) بالجنيه</label>
         <input id="sMonthlyFee" type="number" min="0" value="${editing&&editing.monthlyFee!=null? editing.monthlyFee:''}" placeholder="مثال: 300" style="direction:ltr; text-align:right;">
       </div>
+      <div class="field">
+        <label class="field-label">تاريخ بداية الاشتراك (الحصص اللي قبله ما بتتحسبش عليه)</label>
+        <input id="sStartDate" type="date" value="${editing? (editing.startDate||'') : todayStr()}" style="direction:ltr; text-align:right;">
+      </div>
       <div class="modal-actions">
         <button class="btn btn-primary" id="saveStudent">حفظ</button>
         <button class="btn btn-ghost" id="cancelStudent">إلغاء</button>
@@ -1197,12 +1257,14 @@ async function openStudentModal(studentId){
     const feeRaw = document.getElementById('sMonthlyFee').value;
     const monthlyFee = feeRaw!==''? Math.max(0, Number(feeRaw)||0) : null;
     if(!name){ alert('اكتب اسم الطالب'); return; }
+    const startDateRaw = document.getElementById('sStartDate').value;
+    const startDate = startDateRaw || (editing? null : todayStr());
     let studentRecord;
     if(editing){
-      editing.name=name; editing.groupId=groupId; editing.parentPhone=parentPhone; editing.school=school; editing.subscription=subscription; editing.monthlyFee=monthlyFee;
+      editing.name=name; editing.groupId=groupId; editing.parentPhone=parentPhone; editing.school=school; editing.subscription=subscription; editing.monthlyFee=monthlyFee; editing.startDate=startDate;
       studentRecord = editing;
     } else {
-      studentRecord = {id:uid(), name, groupId, parentPhone, school, subscription, monthlyFee, portalToken:genPortalToken()};
+      studentRecord = {id:uid(), name, groupId, parentPhone, school, subscription, monthlyFee, startDate, portalToken:genPortalToken()};
       state.students.push(studentRecord);
     }
     await sSet('students', state.students);
@@ -2855,7 +2917,7 @@ async function renderSheetBody(){
 }
 
 // ================= PAYMENTS (الاشتراك الشهري = كل 4 حصص) =================
-let paymentsState = { groupId:null, cycle:null, view:'group', month:null };
+let paymentsState = { groupId:null, cycle:null, view:'group', month:null, overallCycle:'current' };
 
 async function getGroupCycleInfo(groupId){
   const keys = await sList(`attendance:${groupId}:`);
@@ -2863,6 +2925,35 @@ async function getGroupCycleInfo(groupId){
   const totalSessions = dates.length;
   const currentCycle = Math.max(1, Math.ceil(totalSessions/4) || 1);
   return { dates, totalSessions, currentCycle };
+}
+
+// === الدورة = كل 4 حصص للمجموعة. الطالب اللي بدأ في نص الدورة بيدفع على قد الحصص اللي فاضلة ===
+function cycleShare(student, cycleDates){
+  if(!student.startDate) return 4;
+  const skipped = cycleDates.filter(d=> d < student.startDate).length;
+  return Math.max(0, 4 - skipped);
+}
+function shareLabel(n){ return n===1? 'حصة واحدة' : n===2? 'حصتين' : n+' حصص'; }
+async function getCycleRows(groupId, cycle, info){
+  const students = studentsOf(groupId);
+  const cycleDates = info.dates.slice((cycle-1)*4, cycle*4);
+  const rows = await Promise.all(students.map(async s=>{
+    const share = cycleShare(s, cycleDates);
+    const due = Math.round((s.monthlyFee||0) * share / 4);
+    const rec = (await sGet(`payment:${s.id}:${cycle}`)) || { paid:false, date:null, amount:null };
+    const paidAmt = rec.paid ? (rec.amount!=null? rec.amount : due) : 0;
+    return { student:s, share, due, rec, paidAmt };
+  }));
+  return { cycleDates, rows };
+}
+function sumCycleRows(rows){
+  const active = rows.filter(r=>r.share>0);
+  return {
+    expected: active.reduce((a,r)=>a+r.due,0),
+    collected: active.reduce((a,r)=>a+r.paidAmt,0),
+    paid: active.filter(r=>r.rec.paid).length,
+    total: active.length
+  };
 }
 
 function fmtMonth(ym){
@@ -2879,7 +2970,7 @@ function renderPayments(main){
   if(!paymentsState.groupId) paymentsState.groupId = state.groups[0].id;
   main.innerHTML = `
     <div class="topbar">
-      <div><div class="tabtitle">المدفوعات</div><div class="tabsub">الاشتراك الشهري = كل 4 حصص</div></div>
+      <div><div class="tabtitle">المدفوعات</div><div class="tabsub">الطالب بيدفع عن كل 4 حصص، ومن بدأ في نص الدورة بيدفع على قد حصصه</div></div>
     </div>
     <div class="row" style="margin-bottom:16px; gap:8px;">
       <button class="btn ${paymentsState.view==='group'?'btn-gold':'btn-ghost'}" id="viewGroupBtn">حسب المجموعة</button>
@@ -2903,7 +2994,7 @@ function renderPayments(main){
         <select id="payGroup">${state.groups.map(g=>`<option value="${g.id}" ${paymentsState.groupId===g.id?'selected':''}>${g.name}</option>`).join('')}</select>
       </div>
       <div>
-        <label class="field-label">الشهر (رقم الدورة)</label>
+        <label class="field-label">الشهر (كل 4 حصص)</label>
         <select id="payCycle"></select>
       </div>
     </div>
@@ -2915,41 +3006,50 @@ function renderPayments(main){
   fillCycleSelect().then(renderPaymentsBody);
 }
 
+async function fillCycleSelect(){
+  const info = await getGroupCycleInfo(paymentsState.groupId);
+  const currentCycle = info.currentCycle;
+  if(!paymentsState.cycle || paymentsState.cycle>currentCycle) paymentsState.cycle = currentCycle;
+  const sel = document.getElementById('payCycle');
+  if(!sel) return;
+  let opts = '';
+  for(let c=currentCycle; c>=1; c--){
+    opts += `<option value="${c}" ${paymentsState.cycle===c? 'selected':''}>الشهر ${c}${c===currentCycle? ' (الحالي)':''}</option>`;
+  }
+  sel.innerHTML = opts;
+  sel.addEventListener('change',(e)=>{ paymentsState.cycle = Number(e.target.value); renderPaymentsBody(); });
+}
+
 async function renderPaymentsOverall(area){
   area.innerHTML = `<div class="loading">جارِ تجميع كل المجموعات...</div>`;
 
-  // 1) aggregate: each group's current cycle, summed together
-  let grandExpected=0, grandCollected=0, grandPaidCount=0, grandTotalStudents=0;
+  const mode = paymentsState.overallCycle || 'current';
+  let grandExpected=0, grandCollected=0, grandPaidCount=0, grandTotalStudents=0, maxCycle=1;
   const perGroupRows = [];
-  // 2) flat list of every payment record (for calendar aggregation)
   const allPaymentRecords = []; // {studentName, groupName, cycle, amount, date}
 
   for(const g of state.groups){
-    const groupStudents = studentsOf(g.id);
-    if(groupStudents.length===0) continue;
-    const { currentCycle } = await getGroupCycleInfo(g.id);
-
-    let gExpected=0, gCollected=0, gPaid=0;
-    for(const s of groupStudents){
-      const fee = s.monthlyFee!=null? s.monthlyFee : 0;
-      gExpected += fee;
-      // scan every cycle 1..currentCycle for calendar aggregation + current cycle for the summary
-      for(let c=1; c<=currentCycle; c++){
-        const rec = await sGet(`payment:${s.id}:${c}`);
-        if(rec && rec.paid){
-          const amount = rec.amount!=null? rec.amount : fee;
-          allPaymentRecords.push({ studentName:s.name, groupName:g.name, cycle:c, amount, date:rec.date });
-          if(c===currentCycle){ gCollected += amount; gPaid++; }
+    if(studentsOf(g.id).length===0) continue;
+    const info = await getGroupCycleInfo(g.id);
+    maxCycle = Math.max(maxCycle, info.currentCycle);
+    const target = mode==='current' ? info.currentCycle : Number(mode);
+    for(let c=1; c<=info.currentCycle; c++){
+      const { cycleDates, rows } = await getCycleRows(g.id, c, info);
+      rows.forEach(r=>{
+        if(r.share>0 && r.rec.paid){
+          allPaymentRecords.push({ studentName:r.student.name, groupName:g.name, cycle:c, amount:r.paidAmt, date:r.rec.date });
         }
+      });
+      if(c===target){
+        const sm = sumCycleRows(rows);
+        grandExpected += sm.expected; grandCollected += sm.collected; grandPaidCount += sm.paid; grandTotalStudents += sm.total;
+        perGroupRows.push({ name:g.name, cycle:c, sessions:cycleDates.length, ...sm });
       }
     }
-    grandExpected += gExpected; grandCollected += gCollected; grandPaidCount += gPaid; grandTotalStudents += groupStudents.length;
-    perGroupRows.push({ name:g.name, currentCycle, expected:gExpected, collected:gCollected, paid:gPaid, total:groupStudents.length });
   }
 
   if(!document.body.contains(area)) return; // stale guard (user navigated away mid-fetch)
 
-  // build calendar month options from actual paid dates + current month
   const monthSet = new Set(allPaymentRecords.filter(r=>r.date).map(r=>r.date.slice(0,7)));
   monthSet.add(todayStr().slice(0,7));
   const months = Array.from(monthSet).sort().reverse();
@@ -2958,9 +3058,16 @@ async function renderPaymentsOverall(area){
   const monthRecords = allPaymentRecords.filter(r=> r.date && r.date.slice(0,7)===paymentsState.month);
   const monthTotal = monthRecords.reduce((sum,r)=>sum+r.amount,0);
 
+  const cycleOptions = `<option value="current" ${mode==='current'?'selected':''}>الشهر الحالي لكل مجموعة</option>` +
+    Array.from({length:maxCycle},(_,i)=>i+1).reverse().map(c=>`<option value="${c}" ${String(mode)===String(c)?'selected':''}>الشهر رقم ${c}</option>`).join('');
+
   area.innerHTML = `
     <div class="card">
-      <div class="section-title">📊 إجمالي كل المجموعات في شهرها الحالي</div>
+      <div class="section-title">📊 إجمالي كل المجموعات (كل 4 حصص)</div>
+      <div style="margin:12px 0;">
+        <label class="field-label">الدورة</label>
+        <select id="overallCycle">${cycleOptions}</select>
+      </div>
       <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); margin-top:12px;">
         <div class="stat"><div class="num">${grandExpected}</div><div class="lbl">المتوقع (جنيه)</div></div>
         <div class="stat"><div class="num">${grandCollected}</div><div class="lbl">المحصّل (جنيه)</div></div>
@@ -2968,15 +3075,24 @@ async function renderPaymentsOverall(area){
         <div class="stat"><div class="num">${grandPaidCount} / ${grandTotalStudents}</div><div class="lbl">عدد الدافعين</div></div>
       </div>
       <table style="margin-top:16px;">
-        <thead><tr><th>المجموعة</th><th>الشهر</th><th>المتوقع</th><th>المحصّل</th><th>الدافعين</th></tr></thead>
+        <thead><tr><th>المجموعة</th><th>الشهر</th><th>الحصص</th><th>المتوقع</th><th>المحصّل</th><th>المتبقي</th><th>الدافعين</th></tr></thead>
         <tbody>
           ${perGroupRows.map(r=>`<tr>
             <td style="font-weight:700;">${r.name}</td>
-            <td>${r.currentCycle}</td>
+            <td>${r.cycle}</td>
+            <td>${r.sessions} / 4</td>
             <td>${r.expected} ج</td>
             <td>${r.collected} ج</td>
+            <td>${r.expected-r.collected} ج</td>
             <td>${r.paid} / ${r.total}</td>
           </tr>`).join('')}
+          <tr style="font-weight:800;">
+            <td>الإجمالي</td><td></td><td></td>
+            <td>${grandExpected} ج</td>
+            <td>${grandCollected} ج</td>
+            <td>${grandExpected-grandCollected} ج</td>
+            <td>${grandPaidCount} / ${grandTotalStudents}</td>
+          </tr>
         </tbody>
       </table>
     </div>
@@ -3007,78 +3123,73 @@ async function renderPaymentsOverall(area){
     </div>
   `;
 
+  document.getElementById('overallCycle').addEventListener('change',(e)=>{
+    paymentsState.overallCycle = e.target.value;
+    renderPaymentsOverall(area);
+  });
   document.getElementById('calMonth').addEventListener('change',(e)=>{
     paymentsState.month = e.target.value;
     renderPaymentsOverall(area);
   });
 }
 
-async function fillCycleSelect(){
-  const { currentCycle } = await getGroupCycleInfo(paymentsState.groupId);
-  if(!paymentsState.cycle) paymentsState.cycle = currentCycle;
-  const sel = document.getElementById('payCycle');
-  let opts = '';
-  for(let c=currentCycle; c>=1; c--){
-    opts += `<option value="${c}" ${paymentsState.cycle===c? 'selected':''}>الشهر ${c}${c===currentCycle? ' (الحالي)':''}</option>`;
-  }
-  sel.innerHTML = opts;
-  sel.addEventListener('change',(e)=>{ paymentsState.cycle = Number(e.target.value); renderPaymentsBody(); });
-}
-
 async function renderPaymentsBody(){
   const body = document.getElementById('paymentsBody');
   const groupId = paymentsState.groupId;
   const cycle = paymentsState.cycle;
-  const groupStudents = studentsOf(groupId);
-  if(groupStudents.length===0){
+  if(groupId==null || !cycle) return;
+  if(studentsOf(groupId).length===0){
     body.innerHTML = `<div class="empty">لا يوجد طلاب في هذه المجموعة.</div>`;
     return;
   }
-  const { dates, currentCycle } = await getGroupCycleInfo(groupId);
-  const cycleDates = dates.slice((cycle-1)*4, cycle*4);
-  const rangeText = cycleDates.length
-    ? `الحصص من ${fmtDate(cycleDates[0])} إلى ${fmtDate(cycleDates[cycleDates.length-1])} (${cycleDates.length} من 4)`
-    : 'لسه معملتش حصص في الشهر ده';
-
-  const rows = await Promise.all(groupStudents.map(async s=>{
-    const rec = (await sGet(`payment:${s.id}:${cycle}`)) || { paid:false, date:null, amount:null };
-    return { student:s, rec };
-  }));
+  const info = await getGroupCycleInfo(groupId);
+  const { cycleDates, rows } = await getCycleRows(groupId, cycle, info);
 
   if(document.getElementById('payGroup')?.value !== groupId) return; // stale guard
 
-  const missingFeeCount = rows.filter(r=>r.student.monthlyFee==null).length;
-  const expectedTotal = rows.reduce((sum,r)=> sum + (r.student.monthlyFee!=null? r.student.monthlyFee : 0), 0);
-  const collectedTotal = rows.reduce((sum,r)=> sum + (r.rec.paid? (r.rec.amount!=null? r.rec.amount : (r.student.monthlyFee||0)) : 0), 0);
-  const remainingTotal = expectedTotal - collectedTotal;
-  const paidCount = rows.filter(r=>r.rec.paid).length;
+  const complete = cycleDates.length===4;
+  const rangeText = cycleDates.length
+    ? `الحصص من ${fmtDate(cycleDates[0])} إلى ${fmtDate(cycleDates[cycleDates.length-1])} (${cycleDates.length} من 4)`
+    : 'لسه معملتش حصص في الشهر ده';
+  const sm = sumCycleRows(rows);
+  const missingFeeCount = rows.filter(r=>r.share>0 && r.student.monthlyFee==null).length;
 
   body.innerHTML = `
     <div class="card">
-      <div class="section-title">📅 الشهر ${cycle}${cycle===currentCycle?' (الحالي)':''}</div>
+      <div class="section-title">📅 الشهر ${cycle}${cycle===info.currentCycle?' (الحالي)':''}</div>
       <div class="report-meta">${rangeText}</div>
       <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); margin-top:16px;">
-        <div class="stat"><div class="num">${expectedTotal}</div><div class="lbl">المتوقع (جنيه)</div></div>
-        <div class="stat"><div class="num">${collectedTotal}</div><div class="lbl">المحصّل (جنيه)</div></div>
-        <div class="stat"><div class="num">${remainingTotal}</div><div class="lbl">المتبقي (جنيه)</div></div>
-        <div class="stat"><div class="num">${paidCount} / ${rows.length}</div><div class="lbl">عدد الدافعين</div></div>
+        <div class="stat"><div class="num">${sm.expected}</div><div class="lbl">المتوقع (جنيه)</div></div>
+        <div class="stat"><div class="num">${sm.collected}</div><div class="lbl">المحصّل (جنيه)</div></div>
+        <div class="stat"><div class="num">${sm.expected-sm.collected}</div><div class="lbl">المتبقي (جنيه)</div></div>
+        <div class="stat"><div class="num">${sm.paid} / ${sm.total}</div><div class="lbl">عدد الدافعين</div></div>
       </div>
       ${missingFeeCount? `<div class="report-meta" style="margin-top:10px;color:var(--late);">⚠️ ${missingFeeCount} طالب لسه معملوش رسوم شهرية محددة في بياناتهم — الحساب هيكون ناقص لحد ما تحددها.</div>`:''}
     </div>
 
     <div class="card">
-      <div class="section-title">👥 حالة كل طالب</div>
+      <div class="section-title">👥 حساب كل طالب في الشهر ${cycle}</div>
       <table>
-        <thead><tr><th>الطالب</th><th>رسوم الشهر</th><th>الحالة</th><th>تاريخ الدفع</th><th></th></tr></thead>
+        <thead><tr><th>الطالب</th><th>رسوم الشهر</th><th>عدد الحصص</th><th>المستحق</th><th>الحالة</th><th>تاريخ الدفع</th><th></th></tr></thead>
         <tbody>
-          ${rows.map(r=>`
+          ${rows.map(r=>{
+            if(r.share===0){
+              return `<tr style="opacity:.6;"><td style="font-weight:700;">${r.student.name}</td><td colspan="6">لسه ما بدأش (اشترك بعد حصص الشهر ده)</td></tr>`;
+            }
+            const badge = r.rec.paid
+              ? `<span class="badge badge-present">دفع ${r.paidAmt} ج ✓</span>`
+              : (complete ? `<span class="badge badge-absent">لسه ما دفعش</span>` : `<span class="badge badge-late">جاري</span>`);
+            return `
             <tr>
               <td style="font-weight:700;">${r.student.name}</td>
               <td>${r.student.monthlyFee!=null? r.student.monthlyFee+' ج' : '<span style="color:var(--late);">غير محدد</span>'}</td>
-              <td><span class="badge ${r.rec.paid?'badge-present':'badge-absent'}">${r.rec.paid?'دفع ✓':'لسه ما دفعش'}</span></td>
+              <td>${shareLabel(r.share)}${r.share<4? ' <span class="report-meta">(بدأ في نص الشهر)</span>' : ''}</td>
+              <td style="font-weight:700;">${r.due} ج</td>
+              <td>${badge}</td>
               <td>${r.rec.paid && r.rec.date? fmtDate(r.rec.date) : '—'}</td>
               <td><button class="btn btn-ghost btn-sm" data-toggle-pay="${r.student.id}">${r.rec.paid?'إلغاء الدفع':'تسجيل الدفع'}</button></td>
-            </tr>`).join('')}
+            </tr>`;
+          }).join('')}
         </tbody>
       </table>
     </div>
@@ -3087,12 +3198,12 @@ async function renderPaymentsBody(){
   body.querySelectorAll('[data-toggle-pay]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       const studentId = btn.dataset.togglePay;
-      const student = state.students.find(s=>s.id===studentId);
+      const row = rows.find(r=>r.student.id===studentId);
       const key = `payment:${studentId}:${cycle}`;
       const current = (await sGet(key)) || { paid:false, date:null, amount:null };
       const newRec = current.paid
         ? { paid:false, date:null, amount:null }
-        : { paid:true, date:todayStr(), amount: (student&&student.monthlyFee!=null)? student.monthlyFee : null };
+        : { paid:true, date:todayStr(), amount: row.due, sessions: row.share };
       await sSet(key, newRec);
       renderPaymentsBody();
     });
