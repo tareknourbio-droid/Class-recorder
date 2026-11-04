@@ -555,7 +555,8 @@ function ensureQRCodeLib(){
 }
 function ensureJsQRLib(){
   if(window.jsQR) return Promise.resolve();
-  return loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.js');
+  return loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.js')
+    .catch(()=> loadScriptOnce('https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js'));
 }
 function ensureXLSXLib(){
   if(window.XLSX) return Promise.resolve();
@@ -1529,6 +1530,24 @@ async function deleteStudent(id, confirmMessage, skipConfirm=false){
 // ================= STUDENT QR CODES =================
 function qrTextFor(student){ return `TNB-STU:${student.id}`; }
 
+function addQrQuietZone(dataUrl, margin){
+  margin = margin || 28;
+  return new Promise((resolve, reject)=>{
+    const img = new Image();
+    img.onload = ()=>{
+      const c = document.createElement('canvas');
+      c.width = img.width + margin*2; c.height = img.height + margin*2;
+      const x = c.getContext('2d');
+      x.fillStyle = '#ffffff'; x.fillRect(0, 0, c.width, c.height);
+      x.imageSmoothingEnabled = false;
+      x.drawImage(img, margin, margin);
+      resolve(c.toDataURL('image/png'));
+    };
+    img.onerror = reject;
+    img.src = dataUrl;
+  });
+}
+
 // Renders a QR code into a plain (non-attached) div and resolves with its dataURL.
 async function renderQrDataUrl(text){
   try{ await ensureQRCodeLib(); }catch(e){ return null; }
@@ -1539,14 +1558,16 @@ async function renderQrDataUrl(text){
     try{
       new QRCode(tmp, { text, width:220, height:220, colorDark:'#0A1626', colorLight:'#ffffff', correctLevel: QRCode.CorrectLevel.M });
     }catch(e){ document.body.removeChild(tmp); resolve(null); return; }
-    setTimeout(()=>{
+    setTimeout(async ()=>{
       const canvas = tmp.querySelector('canvas');
       const img = tmp.querySelector('img');
       let dataUrl = null;
       if(canvas) dataUrl = canvas.toDataURL('image/png');
       else if(img) dataUrl = img.src;
       document.body.removeChild(tmp);
-      resolve(dataUrl);
+      if(!dataUrl){ resolve(null); return; }
+      // نضيف إطار أبيض حوالين الكود (Quiet zone) عشان الكاميرا تقراه بسهولة
+      try{ resolve(await addQrQuietZone(dataUrl)); }catch(e){ resolve(dataUrl); }
     }, 60);
   });
 }
@@ -2047,6 +2068,10 @@ async function openQrScanModal(){
       </div>
       <canvas id="qrCanvas" style="display:none;"></canvas>
       <div class="qr-status" id="qrStatus">جارِ تشغيل الكاميرا...</div>
+      <div class="qr-manual-row" style="margin-top:8px;">
+        <button class="btn btn-ghost btn-sm" id="qrPhotoBtn" style="flex:1; justify-content:center;">📸 لو المسح المباشر مش بيقرا: صوّر الكود</button>
+        <input type="file" id="qrPhotoInput" accept="image/*" capture="environment" style="display:none;">
+      </div>
       <div class="qr-log" id="qrScanLog"></div>
       <div class="qr-manual-row">
         <input id="qrManualInput" placeholder="أو أدخل كود الطالب يدويًا">
@@ -2060,6 +2085,12 @@ async function openQrScanModal(){
   qrLastHits = {};
 
   overlay.querySelector('#qrCloseBtn').addEventListener('click', closeQrScanModal);
+  overlay.querySelector('#qrPhotoBtn').addEventListener('click', ()=> overlay.querySelector('#qrPhotoInput').click());
+  overlay.querySelector('#qrPhotoInput').addEventListener('change', async (e)=>{
+    const f = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if(f) await decodeQrFromFile(f);
+  });
   overlay.addEventListener('click',(e)=>{ if(e.target===overlay) closeQrScanModal(); });
   overlay.querySelector('#qrManualBtn').addEventListener('click', ()=>{
     const input = document.getElementById('qrManualInput');
@@ -2072,41 +2103,170 @@ async function openQrScanModal(){
 
   const statusEl = document.getElementById('qrStatus');
   const video = document.getElementById('qrVideo');
-  ensureJsQRLib().catch(()=>{ statusEl.textContent = 'تعذّر تحميل مكتبة قراءة QR، تأكد من الإنترنت. تقدر تستخدم الإدخال اليدوي.'; });
+  let libFailed = false;
+  ensureJsQRLib().catch(()=>{ libFailed = true; });
+
+  // قارئ الباركود الأصلي في المتصفح (أسرع بكتير على الموبايل) لو متاح
+  qrDetector = null;
   try{
-    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
-      throw new Error('no-camera-api');
+    if('BarcodeDetector' in window) qrDetector = new BarcodeDetector({ formats:['qr_code'] });
+  }catch(e){ qrDetector = null; }
+
+  try{
+    if(!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      throw Object.assign(new Error('no-camera-api'), { name:'NoCameraApi' });
     }
-    qrScanStream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:'environment' }, audio:false });
+    qrScanStream = await openQrCameraStream();
     video.srcObject = qrScanStream;
+    video.setAttribute('playsinline',''); video.muted = true;
     await video.play();
     qrScanning = true;
-    statusEl.textContent = 'وجّه الكاميرا لكود QR بطاقة الطالب...';
+    qrLastScan = 0; qrBusy = false;
+    try{
+      const track = qrScanStream.getVideoTracks()[0];
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      if(caps.focusMode && caps.focusMode.includes('continuous')) await track.applyConstraints({ advanced:[{ focusMode:'continuous' }] });
+    }catch(e){ /* مش مهم */ }
+    statusEl.textContent = 'وجّه الكاميرا لكود QR بطاقة الطالب وخلّيه واضح وفي نص الإطار...';
     requestAnimationFrame(qrScanTick);
+    // لو مفيش قارئ أصلي والمكتبة ما اتحمّلتش، نبلّغه بعد ثواني
+    setTimeout(()=>{
+      if(qrScanning && !qrDetector && !window.jsQR){
+        statusEl.textContent = libFailed
+          ? 'تعذّر تحميل مكتبة قراءة QR، اتأكد من الإنترنت أو استخدم الإدخال اليدوي.'
+          : 'جارِ تحميل مكتبة قراءة QR...';
+      }
+    }, 4000);
   }catch(err){
-    statusEl.textContent = 'تعذّر تشغيل الكاميرا. استخدم الإدخال اليدوي بالأسفل، أو اسمح للمتصفح بالوصول للكاميرا.';
+    statusEl.textContent = qrCameraErrorMessage(err);
   }
 }
 
-function qrScanTick(){
+// بنجرّب إعدادات كاميرا أبسط لو الأولى ما اشتغلتش (بعض الموبايلات بترفض القيود)
+async function openQrCameraStream(){
+  const attempts = [
+    { video:{ facingMode:{ ideal:'environment' }, width:{ ideal:1280 }, height:{ ideal:720 } }, audio:false },
+    { video:{ facingMode:'environment' }, audio:false },
+    { video:true, audio:false }
+  ];
+  let lastErr;
+  for(const c of attempts){
+    try{ return await navigator.mediaDevices.getUserMedia(c); }
+    catch(e){
+      lastErr = e;
+      if(e && (e.name==='NotAllowedError' || e.name==='SecurityError' || e.name==='NotReadableError')) break;
+    }
+  }
+  throw lastErr;
+}
+
+function qrCameraErrorMessage(err){
+  const name = err && err.name;
+  const ua = navigator.userAgent || '';
+  if(/FBAN|FBAV|Instagram|Line\/|Snapchat|MicroMessenger|; wv\)/i.test(ua)){
+    return 'المتصفح الداخلي (فيسبوك/واتساب/إلخ) بيمنع الكاميرا. افتح رابط الأداة من Chrome أو Safari، أو استخدم الإدخال اليدوي.';
+  }
+  if(name==='NoCameraApi' || !window.isSecureContext){
+    return 'الكاميرا بتشتغل بس لما الأداة تتفتح من رابط آمن (https). افتحها من الرابط الأساسي مش من ملف على الموبايل.';
+  }
+  if(name==='NotAllowedError' || name==='SecurityError'){
+    return 'الكاميرا مش مسموحة. اضغط على القفل 🔒 جنب الرابط واسمح بالكاميرا، أو من إعدادات الموبايل للمتصفح، وبعدها افتح المسح تاني.';
+  }
+  if(name==='NotFoundError' || name==='OverconstrainedError'){
+    return 'مش لاقي كاميرا على الجهاز. استخدم الإدخال اليدوي بالأسفل.';
+  }
+  if(name==='NotReadableError' || name==='AbortError'){
+    return 'الكاميرا مشغولة في تطبيق تاني. اقفل التطبيقات التانية اللي بتستخدمها وجرّب تاني.';
+  }
+  return 'تعذّر تشغيل الكاميرا. استخدم الإدخال اليدوي بالأسفل، أو اسمح للمتصفح بالوصول للكاميرا.';
+}
+
+let qrDetector = null, qrLastScan = 0, qrBusy = false;
+
+async function qrScanTick(){
   if(!qrScanning) return;
-  const video = document.getElementById('qrVideo');
-  const canvas = document.getElementById('qrCanvas');
-  if(video && canvas && video.readyState === video.HAVE_ENOUGH_DATA && window.jsQR){
-    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    try{
-      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const code = jsQR(imgData.data, imgData.width, imgData.height);
-      if(code && code.data) processQrText(code.data);
-    }catch(e){ /* ignore transient decode errors */ }
+  const now = performance.now();
+  if(!qrBusy && now - qrLastScan > 140){
+    qrLastScan = now; qrBusy = true;
+    try{ await qrDecodeFrame(); }catch(e){ /* ignore transient decode errors */ }
+    qrBusy = false;
   }
   if(qrScanning) requestAnimationFrame(qrScanTick);
 }
 
+let qrDetectorFails = 0;
+function qrWithTimeout(promise, ms){
+  return Promise.race([ promise, new Promise((_,rej)=> setTimeout(()=>rej(new Error('timeout')), ms)) ]);
+}
+
+async function qrDecodeFrame(){
+  const video = document.getElementById('qrVideo');
+  const canvas = document.getElementById('qrCanvas');
+  if(!video || !canvas || video.readyState < 2 || !video.videoWidth) return;
+
+  if(qrDetector){
+    try{
+      const codes = await qrWithTimeout(qrDetector.detect(video), 700);
+      qrDetectorFails = 0;
+      if(codes && codes.length && codes[0].rawValue){ processQrText(codes[0].rawValue); return; }
+    }catch(e){
+      if(++qrDetectorFails >= 3) qrDetector = null; // القارئ الأصلي مش مستقر، نكمّل بالمكتبة بس
+    }
+  }
+  if(!window.jsQR) return;
+
+  // بنصغّر الصورة (أقصى 800px) عشان القراءة تبقى سريعة على الموبايل
+  const scale = Math.min(1, 800 / Math.max(video.videoWidth, video.videoHeight));
+  const w = Math.max(1, Math.round(video.videoWidth * scale));
+  const h = Math.max(1, Math.round(video.videoHeight * scale));
+  if(canvas.width !== w) canvas.width = w;
+  if(canvas.height !== h) canvas.height = h;
+  const ctx = canvas.getContext('2d', { willReadFrequently:true });
+  ctx.drawImage(video, 0, 0, w, h);
+  const img = ctx.getImageData(0, 0, w, h);
+  const code = jsQR(img.data, w, h, { inversionAttempts:'attemptBoth' });
+  if(code && code.data) processQrText(code.data);
+}
+
+// قراءة كود QR من صورة (صوّرها بكاميرا الموبايل العادية)
+async function decodeQrFromFile(file){
+  const statusEl = document.getElementById('qrStatus');
+  if(statusEl) statusEl.textContent = 'جارِ قراءة الصورة...';
+  try{ await ensureJsQRLib(); }catch(e){ /* هنكمّل بالقارئ الأصلي لو موجود */ }
+  const url = URL.createObjectURL(file);
+  try{
+    const img = new Image();
+    await new Promise((res, rej)=>{ img.onload = res; img.onerror = rej; img.src = url; });
+    const canvas = document.createElement('canvas');
+    for(const max of [1000, 640, 1600]){
+      const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+      const w = Math.max(1, Math.round(img.naturalWidth * scale));
+      const h = Math.max(1, Math.round(img.naturalHeight * scale));
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d', { willReadFrequently:true });
+      ctx.drawImage(img, 0, 0, w, h);
+      if(qrDetector){
+        try{
+          const codes = await qrWithTimeout(qrDetector.detect(canvas), 1500);
+          if(codes && codes.length && codes[0].rawValue){ await processQrText(codes[0].rawValue); return; }
+        }catch(e){}
+      }
+      if(window.jsQR){
+        const data = ctx.getImageData(0, 0, w, h);
+        const code = jsQR(data.data, w, h, { inversionAttempts:'attemptBoth' });
+        if(code && code.data){ await processQrText(code.data); return; }
+      }
+    }
+    if(statusEl) statusEl.textContent = 'ما قدرتش أقرا الكود من الصورة. قرّب الكاميرا من الكود وخلّيه واضح وكامل في الصورة وجرّب تاني.';
+  }catch(e){
+    if(statusEl) statusEl.textContent = 'تعذّر فتح الصورة، جرّب تاني.';
+  }finally{
+    URL.revokeObjectURL(url);
+  }
+}
+
 function closeQrScanModal(){
-  qrScanning = false;
+  qrScanning = false; qrBusy = false;
   if(qrScanStream){ qrScanStream.getTracks().forEach(t=>t.stop()); qrScanStream = null; }
   const overlay = document.getElementById('qrScanOverlay');
   if(overlay) overlay.remove();
@@ -3826,3 +3986,4 @@ if('serviceWorker' in navigator){
 </script>
 </body>
 </html>
+
